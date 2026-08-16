@@ -35,8 +35,8 @@ from ..trace.templates.gemm import (
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
     mm_bf16_trace,
-    mm_fp4_trace,
-    mm_fp8_trace,
+    mm_fp4_trace_dispatch,
+    mm_fp8_trace_dispatch,
     mm_mxfp8_trace,
 )
 from ..trace.templates.attention import segment_gemm_run_trace
@@ -4528,7 +4528,7 @@ def _check_mm_fp8_problem_size(
     return True
 
 
-@flashinfer_api(trace=mm_fp8_trace)
+@flashinfer_api(trace=mm_fp8_trace_dispatch)
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7008,7 +7008,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
-@flashinfer_api(trace=mm_fp4_trace)
+@flashinfer_api(trace=mm_fp4_trace_dispatch)
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,

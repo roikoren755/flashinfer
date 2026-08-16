@@ -1,0 +1,165 @@
+{
+  "name": "mm_fp4_trtllm_relu2_nvfp4_r128c4_kp64_n128_bs16",
+  "description": "NVFP4 GEMM with R128C4 activation scales, fused Relu2, and direct packed NVFP4 output plus a required R128c4 E4M3 scale sidecar.",
+  "op_type": "gemm_fp4",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_base.mm_fp4",
+    "status:experimental",
+    "backend:trtllm",
+    "activation:relu2",
+    "input:nvfp4",
+    "input_scale_layout:r128c4",
+    "quantization:nvfp4",
+    "output_scale_layout:r128c4",
+    "fused"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Token rows."
+    },
+    "K_packed": {
+      "type": "const",
+      "value": 64,
+      "description": "Packed E2M1 K storage (logical K / 2)."
+    },
+    "N": {
+      "type": "const",
+      "value": 128,
+      "description": "Physical output features."
+    },
+    "A_scale_rows": {
+      "type": "var",
+      "description": "Physical R128c4 activation-scale rows."
+    },
+    "K_scale": {
+      "type": "const",
+      "value": 8,
+      "description": "Physical K scale columns, padded to a multiple of 4."
+    },
+    "N_padded": {
+      "type": "const",
+      "value": 128,
+      "description": "Physical weight-scale rows, padded to 128."
+    },
+    "block_size": {
+      "type": "const",
+      "value": 16,
+      "description": "NVFP4 scale block size; generated kernels require 16."
+    },
+    "use_8x4_sf_layout": {
+      "type": "const",
+      "value": 0,
+      "description": "1 for R8c4 activation scales, 0 for R128c4."
+    },
+    "one": {
+      "type": "const",
+      "value": 1,
+      "description": "One-element scale tensor extent."
+    },
+    "N_packed": {
+      "type": "var",
+      "description": "Packed output columns (N / 2)."
+    },
+    "M_scale": {
+      "type": "var",
+      "description": "R128c4 output-scale rows."
+    },
+    "N_scale": {
+      "type": "var",
+      "description": "R128c4 output-scale columns."
+    }
+  },
+  "constraints": [
+    "block_size == 16",
+    "use_8x4_sf_layout == 0",
+    "K_packed * 2 % (4 * block_size) == 0",
+    "A_scale_rows == ((M + 127) // 128) * 128",
+    "K_scale == ((((K_packed * 2) // block_size) + 3) // 4) * 4",
+    "N_padded == ((N + 127) // 128) * 128",
+    "one == 1",
+    "N % (4 * block_size) == 0",
+    "N_packed == N // 2",
+    "M_scale == ((M + 127) // 128) * 128",
+    "N_scale == (((N // block_size) + 3) // 4) * 4"
+  ],
+  "inputs": {
+    "A": {
+      "shape": [
+        "M",
+        "K_packed"
+      ],
+      "dtype": "uint8",
+      "description": "Row-major packed NVFP4 E2M1 activations."
+    },
+    "B": {
+      "shape": [
+        "K_packed",
+        "N"
+      ],
+      "dtype": "uint8",
+      "description": "Column-major [K/2, N] view of a TRTLLM-shuffled packed weight."
+    },
+    "a_descale": {
+      "shape": [
+        "A_scale_rows",
+        "K_scale"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Prepared R128c4 NVFP4 activation block scales."
+    },
+    "b_descale": {
+      "shape": [
+        "K_scale",
+        "N_padded"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Transpose view of the TRTLLM-shuffled weight-scale buffer; b_descale.T is contiguous."
+    },
+    "alpha": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "float32",
+      "description": "Combined activation/weight global decode multiplier."
+    },
+    "block_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "NVFP4 block size (16)."
+    },
+    "use_8x4_sf_layout": {
+      "shape": null,
+      "dtype": "bool",
+      "description": "Selects the R128c4 activation-scale layout."
+    },
+    "output_quant_scale": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "float32",
+      "description": "NVFP4 producer quantization multiplier."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "M",
+        "N_packed"
+      ],
+      "dtype": "uint8",
+      "description": "Returned packed E2M1 result, written to out when supplied."
+    },
+    "out_scale": {
+      "shape": [
+        "M_scale",
+        "N_scale"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "R128c4 E4M3 scale output."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\n@torch.no_grad()\ndef _mm_fp4_trtllm_matmul_reference(\n    a,\n    b,\n    a_descale,\n    b_descale,\n    alpha,\n    block_size=16,\n    use_8x4_sf_layout=False,\n    **_unused,\n):\n    \"\"\"Dequantize TRTLLM-prepared NVFP4 operands and compute A @ B.\"\"\"\n\n    fp4_values = torch.tensor(\n        (\n            0.0,\n            0.5,\n            1.0,\n            1.5,\n            2.0,\n            3.0,\n            4.0,\n            6.0,\n            -0.0,\n            -0.5,\n            -1.0,\n            -1.5,\n            -2.0,\n            -3.0,\n            -4.0,\n            -6.0,\n        ),\n        dtype=torch.float32,\n        device=a.device,\n    )\n\n    def unpack_fp4(packed):\n        packed = packed.to(torch.int64)\n        codes = torch.stack([packed & 0xF, (packed >> 4) & 0xF], dim=-1)\n        return fp4_values[codes.reshape(packed.shape[0], -1)]\n\n    def unswizzle_scale(scale, rows, columns, row_tile):\n        padded_columns = (columns + 3) // 4 * 4\n        row = torch.arange(rows, dtype=torch.int64, device=scale.device).unsqueeze(1)\n        column = torch.arange(\n            columns, dtype=torch.int64, device=scale.device\n        ).unsqueeze(0)\n        if row_tile == 8:\n            offsets = (\n                (row // 8) * (padded_columns // 4) * 32\n                + (column // 4) * 32\n                + (row % 8) * 4\n                + column % 4\n            )\n        else:\n            offsets = (\n                column % 4\n                + (column // 4) * 512\n                + (row % 32) * 16\n                + ((row % 128) // 32) * 4\n                + (row // 128) * (128 * padded_columns)\n            )\n        return scale.reshape(-1)[offsets]\n\n    def unshuffle_weight_rows(shuffled):\n        from flashinfer.utils import get_shuffle_matrix_a_row_indices\n\n        row_indices = get_shuffle_matrix_a_row_indices(shuffled, 128).to(\n            shuffled.device\n        )\n        unshuffled = torch.empty_like(shuffled)\n        unshuffled[row_indices] = shuffled\n        return unshuffled\n\n    m, k_packed = a.shape\n    k = k_packed * 2\n    scale_columns = k // block_size\n    a_scale = (\n        unswizzle_scale(\n            a_descale,\n            m,\n            scale_columns,\n            8 if use_8x4_sf_layout else 128,\n        )\n        .view(torch.uint8)\n        .view(torch.float8_e4m3fn)\n        .to(torch.float32)\n    )\n    a_value = unpack_fp4(a) * a_scale.repeat_interleave(block_size, dim=1)\n\n    weight = unshuffle_weight_rows(b.T.contiguous())\n    shuffled_weight_scale = unswizzle_scale(\n        b_descale.T.contiguous(),\n        weight.shape[0],\n        scale_columns,\n        128,\n    )\n    weight_scale = (\n        unshuffle_weight_rows(shuffled_weight_scale)\n        .view(torch.uint8)\n        .view(torch.float8_e4m3fn)\n        .to(torch.float32)\n    )\n    weight_value = unpack_fp4(weight) * weight_scale.repeat_interleave(\n        block_size, dim=1\n    )\n    return (a_value @ weight_value.T).mul(alpha.to(torch.float32))\n\n@torch.no_grad()\ndef _mm_fp4_trtllm_relu2_value_reference(\n    a,\n    b,\n    a_descale,\n    b_descale,\n    alpha,\n    block_size=16,\n    use_8x4_sf_layout=False,\n    **kwargs,\n):\n    value = _mm_fp4_trtllm_matmul_reference(\n        a,\n        b,\n        a_descale,\n        b_descale,\n        alpha,\n        block_size=block_size,\n        use_8x4_sf_layout=use_8x4_sf_layout,\n        **kwargs,\n    )\n    return torch.relu(value).square().to(torch.bfloat16)\n\n# ----- reference -----\n@torch.no_grad()\ndef _mm_fp4_trtllm_relu2_nvfp4_reference(\n    a,\n    b,\n    a_descale,\n    b_descale,\n    alpha,\n    output_quant_scale,\n    block_size=16,\n    use_8x4_sf_layout=False,\n    **kwargs,\n):\n    from flashinfer import nvfp4_quantize\n    from flashinfer.quantization.fp4_quantization import SfLayout\n\n    value = _mm_fp4_trtllm_relu2_value_reference(\n        a,\n        b,\n        a_descale,\n        b_descale,\n        alpha,\n        block_size=block_size,\n        use_8x4_sf_layout=use_8x4_sf_layout,\n        **kwargs,\n    )\n    packed, scale = nvfp4_quantize(\n        value,\n        output_quant_scale,\n        sfLayout=SfLayout.layout_128x4,\n        do_shuffle=False,\n    )\n    # ``nvfp4_quantize`` returns the physical UE4M3 bytes as uint8.  The trace\n    # declares the scale output as E4M3, so its reference must honor that\n    # contract.\n    scale = scale.view(torch.float8_e4m3fn)\n    return packed, scale\n",
+  "check": "def _fp4_gemm_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    rtol=None,\n    atol=None,\n    max_mismatch_pct=100.0,\n    min_cos_sim=0.97,\n):\n    from flashinfer.trace import default_check\n\n    # Matches tests/gemm/test_mm_fp4.py.\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init dependencies -----\ndef _mm_fp4_trtllm_init_impl(\n    *,\n    M: int,\n    K_packed: int,\n    N: int,\n    use_8x4_sf_layout: bool,\n    activation: str,\n    quantized: bool,\n    device: str,\n    seed: int,\n):\n    \"\"\"Build packed values and physical scale layouts for TRTLLM NVFP4.\"\"\"\n\n    if str(device).startswith(\"cpu\"):\n        raise NotImplementedError(\"TRTLLM NVFP4 trace init requires CUDA\")\n\n    from flashinfer import SfLayout, nvfp4_quantize  # noqa: PLC0415\n\n    torch.manual_seed(seed)\n    K = K_packed * 2\n    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.02\n    weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.02\n    a_multiplier = torch.tensor(\n        [448.0 * 6.0], dtype=torch.float32, device=device\n    ) / a_bf16.float().abs().amax().clamp_min(1e-6)\n    weight_multiplier = torch.tensor(\n        [448.0 * 6.0], dtype=torch.float32, device=device\n    ) / weight_bf16.float().abs().amax().clamp_min(1e-6)\n    input_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4\n    a, a_descale = nvfp4_quantize(\n        a_bf16,\n        a_multiplier,\n        sfLayout=input_layout,\n        do_shuffle=False,\n    )\n    weight, weight_descale = nvfp4_quantize(\n        weight_bf16,\n        weight_multiplier,\n        sfLayout=SfLayout.layout_128x4,\n        do_shuffle=True,\n    )\n    # nvfp4_quantize returns raw UE4M3 scale bytes.  Reinterpret those bytes\n    # so replay inputs match the trace's declared E4M3 physical contract.\n    a_descale = a_descale.view(torch.float8_e4m3fn)\n    weight_descale = weight_descale.view(torch.float8_e4m3fn)\n    out_dtype = torch.uint8 if quantized else torch.bfloat16\n    inputs = {\n        \"a\": a.contiguous(),\n        # Both tensors stay transpose views of contiguous shuffled [N, K/2]\n        # and [N_padded, K_scale] storage, matching the public TRTLLM checks.\n        \"b\": weight.contiguous().T,\n        \"a_descale\": a_descale,\n        \"b_descale\": weight_descale.contiguous().T,\n        \"alpha\": (a_multiplier * weight_multiplier).reciprocal().reshape(1),\n        \"out_dtype\": out_dtype,\n        \"out\": torch.empty(\n            M, N // 2 if quantized else N, dtype=out_dtype, device=device\n        ),\n        \"block_size\": 16,\n        \"use_8x4_sf_layout\": use_8x4_sf_layout,\n        \"backend\": \"trtllm\",\n        \"use_nvfp4\": True,\n        \"activation\": activation,\n    }\n    if quantized:\n        reference = torch.relu(a_bf16.float() @ weight_bf16.float().T).square()\n        output_quant_scale = torch.tensor(\n            [448.0 * 6.0], dtype=torch.float32, device=device\n        ) / reference.abs().amax().clamp_min(1e-6)\n        inputs.update(\n            output_quant_scale=output_quant_scale.reshape(1),\n            # Generated kernels leave scale entries for padded rows unspecified.\n            # Zero initialization keeps those unobserved entries deterministic\n            # in standalone trace replays without changing the logical output.\n            out_scale=torch.zeros(\n                (M + 127) // 128 * 128,\n                (N // 16 + 3) // 4 * 4,\n                dtype=torch.float8_e4m3fn,\n                device=device,\n            ),\n        )\n    return inputs\n\n# ----- init -----\ndef _mm_fp4_trtllm_relu2_nvfp4_r128c4_init(\n    *,\n    M: int,\n    A_scale_rows: int,\n    N_packed: int,\n    M_scale: int,\n    K_packed: int = 64,\n    N: int = 128,\n    K_scale: int = 0,\n    N_padded: int = 0,\n    block_size: int = 16,\n    use_8x4_sf_layout: int = 0,\n    one: int = 1,\n    N_scale: int = 0,\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build an R128c4 NVFP4 Relu2-to-NVFP4 replay bundle.\"\"\"\n\n    return _mm_fp4_trtllm_init_impl(\n        M=M,\n        K_packed=K_packed,\n        N=N,\n        use_8x4_sf_layout=False,\n        activation=\"relu2\",\n        quantized=True,\n        device=device,\n        seed=seed,\n    )\n"
+}

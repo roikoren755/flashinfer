@@ -26,6 +26,13 @@ packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+mm_fp4_trtllm_identity_bf16_r128c4_kp64_n128_bs16.json
+mm_fp4_trtllm_relu2_bf16_r128c4_kp64_n128_bs16.json
+mm_fp4_trtllm_relu2_bf16_r8c4_kp64_n128_bs16.json
+mm_fp4_trtllm_relu2_nvfp4_r128c4_kp64_n128_bs16.json
+mm_fp8_trtllm_identity_bf16_k128_n128.json
+mm_fp8_trtllm_relu2_bf16_k128_n128.json
+mm_fp8_trtllm_relu2_fp8_k128_n128.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
@@ -388,6 +395,84 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── Explicit TRTLLM GEMM activation / output variants ────────────────────────────
+# These direct fi_trace calls describe all seven new contracts without launching
+# a kernel. The generic aligned dimensions keep the examples inexpensive.
+M, K, N = 8, 128, 128
+trtllm_alpha = torch.ones(1, dtype=torch.float32, device=device)
+
+for activation, out_dtype in (
+    ("none", torch.bfloat16),
+    ("relu2", torch.bfloat16),
+    ("relu2", torch.float8_e4m3fn),
+):
+    quantize_output = out_dtype == torch.float8_e4m3fn
+    flashinfer.mm_fp8.fi_trace(
+        save_dir=SAVE_DIR,
+        a=torch.empty(M, K, dtype=torch.float8_e4m3fn, device=device),
+        b=torch.empty(N, K, dtype=torch.float8_e4m3fn, device=device).T,
+        alpha=trtllm_alpha,
+        out_dtype=out_dtype,
+        out=torch.empty(M, N, dtype=out_dtype, device=device),
+        backend="trtllm",
+        activation=activation,
+        output_quant_scale=(
+            torch.ones(1, dtype=torch.float32, device=device)
+            if quantize_output
+            else None
+        ),
+    )
+
+k_scale = (K // 16 + 3) // 4 * 4
+n_padded = (N + 127) // 128 * 128
+for activation, use_8x4_sf_layout, quantize_output in (
+    ("none", False, False),
+    ("relu2", False, False),
+    ("relu2", True, False),
+    ("relu2", False, True),
+):
+    row_tile = 8 if use_8x4_sf_layout else 128
+    out_dtype = torch.uint8 if quantize_output else torch.bfloat16
+    flashinfer.mm_fp4.fi_trace(
+        save_dir=SAVE_DIR,
+        a=torch.empty(M, K // 2, dtype=torch.uint8, device=device),
+        b=torch.empty(N, K // 2, dtype=torch.uint8, device=device).T,
+        a_descale=torch.empty(
+            (M + row_tile - 1) // row_tile * row_tile,
+            k_scale,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        b_descale=torch.empty(
+            n_padded, k_scale, dtype=torch.float8_e4m3fn, device=device
+        ).T,
+        alpha=trtllm_alpha,
+        out_dtype=out_dtype,
+        out=torch.empty(
+            M, N // 2 if quantize_output else N, dtype=out_dtype, device=device
+        ),
+        block_size=16,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        backend="trtllm",
+        use_nvfp4=True,
+        activation=activation,
+        output_quant_scale=(
+            torch.ones(1, dtype=torch.float32, device=device)
+            if quantize_output
+            else None
+        ),
+        out_scale=(
+            torch.empty(
+                (M + 127) // 128 * 128,
+                (N // 16 + 3) // 4 * 4,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            if quantize_output
+            else None
+        ),
+    )
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.

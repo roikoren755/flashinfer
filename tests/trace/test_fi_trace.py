@@ -160,6 +160,317 @@ def test_gemm_trace_check_tolerances_match_unit_tests():
     assert not bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.2])])
 
 
+@pytest.mark.parametrize(
+    ("activation", "out_dtype", "expected_prefix", "quantized"),
+    [
+        ("none", torch.bfloat16, "mm_fp8_trtllm_identity_bf16", False),
+        ("relu2", torch.bfloat16, "mm_fp8_trtllm_relu2_bf16", False),
+        ("relu2", torch.float8_e4m3fn, "mm_fp8_trtllm_relu2_fp8", True),
+    ],
+)
+def test_mm_fp8_trtllm_trace_dispatch(
+    activation, out_dtype, expected_prefix, quantized
+):
+    m, n, k = 8, 64, 128
+    kwargs = {
+        "a": torch.empty(m, k, dtype=torch.float8_e4m3fn),
+        "b": torch.empty(n, k, dtype=torch.float8_e4m3fn).T,
+        "alpha": torch.ones(1, dtype=torch.float32),
+        "out_dtype": out_dtype,
+        "out": torch.empty(m, n, dtype=out_dtype),
+        "backend": "trtllm",
+        "activation": activation,
+    }
+    if quantized:
+        kwargs["output_quant_scale"] = torch.ones(1, dtype=torch.float32)
+
+    defn = flashinfer.mm_fp8.fi_trace(**kwargs)
+
+    _check_defn(defn, "gemm_fp8", "mm_fp8")
+    assert defn["name"].startswith(expected_prefix)
+    assert defn["outputs"]["out"]["shape"] == ["M", "N"]
+    assert defn["outputs"]["out"]["dtype"] == str(out_dtype).removeprefix("torch.")
+    assert "backend:trtllm" in defn["tags"]
+    assert f"activation:{activation}" in defn["tags"]
+    assert "out" not in defn["inputs"]
+    assert ("output_quant_scale" in defn["inputs"]) is quantized
+    assert "init" in defn
+
+
+@pytest.mark.parametrize(
+    (
+        "out_dtype",
+        "expected_prefix",
+        "activation",
+        "quantized",
+        "use_8x4_sf_layout",
+    ),
+    [
+        (torch.bfloat16, "mm_fp4_trtllm_identity_bf16", "none", False, False),
+        (torch.bfloat16, "mm_fp4_trtllm_relu2_bf16", "relu2", False, False),
+        (torch.bfloat16, "mm_fp4_trtllm_relu2_bf16", "relu2", False, True),
+        (torch.uint8, "mm_fp4_trtllm_relu2_nvfp4", "relu2", True, False),
+    ],
+)
+def test_mm_fp4_trtllm_trace_dispatch(
+    out_dtype,
+    expected_prefix,
+    activation,
+    quantized,
+    use_8x4_sf_layout,
+):
+    m, n, k = 9, 64, 128
+    layout = "r8c4" if use_8x4_sf_layout else "r128c4"
+    a_scale_rows = 16 if use_8x4_sf_layout else 128
+    kwargs = {
+        "a": torch.empty(m, k // 2, dtype=torch.uint8),
+        "b": torch.empty(n, k // 2, dtype=torch.uint8).T,
+        "a_descale": torch.empty(a_scale_rows, k // 16, dtype=torch.float8_e4m3fn),
+        "b_descale": torch.empty(128, k // 16, dtype=torch.float8_e4m3fn).T,
+        "alpha": torch.ones(1, dtype=torch.float32),
+        "out_dtype": out_dtype,
+        "out": torch.empty(m, n // 2 if quantized else n, dtype=out_dtype),
+        "block_size": 16,
+        "use_8x4_sf_layout": use_8x4_sf_layout,
+        "backend": "trtllm",
+        "activation": activation,
+    }
+    if quantized:
+        kwargs.update(
+            output_quant_scale=torch.ones(1, dtype=torch.float32),
+            out_scale=torch.empty(128, n // 16, dtype=torch.float8_e4m3fn),
+        )
+
+    defn = flashinfer.mm_fp4.fi_trace(**kwargs)
+
+    _check_defn(defn, "gemm_fp4", "mm_fp4")
+    assert defn["name"].startswith(f"{expected_prefix}_{layout}")
+    assert "backend:trtllm" in defn["tags"]
+    assert f"activation:{activation}" in defn["tags"]
+    assert f"input_scale_layout:{layout}" in defn["tags"]
+    assert defn["axes"]["use_8x4_sf_layout"]["value"] == int(use_8x4_sf_layout)
+    assert "block_size == 16" in defn["constraints"]
+    assert f"use_8x4_sf_layout == {int(use_8x4_sf_layout)}" in defn["constraints"]
+    assert "param" not in defn["outputs"]["out"]
+    assert "out" not in defn["inputs"]
+    assert defn["outputs"]["out"]["dtype"] == str(out_dtype).removeprefix("torch.")
+    assert "reference" in defn
+    assert "init" in defn
+    assert "min_cos_sim=0.97" in defn["check"]
+    if quantized:
+        assert "N_packed == N // 2" in defn["constraints"]
+        assert "output_quant_scale" in defn["inputs"]
+        assert "param" not in defn["outputs"]["out_scale"]
+        assert "optional" not in defn["outputs"]["out_scale"]
+        assert "out_scale" not in defn["inputs"]
+        assert defn["axes"]["N_scale"]["type"] == "var"
+    else:
+        assert "out_scale" not in defn["outputs"]
+        assert "out_scale" not in defn["inputs"]
+
+
+@pytest.mark.parametrize(
+    ("use_8x4_sf_layout", "a_scale_rows"), [(False, 128), (True, 16)]
+)
+def test_mm_fp4_trtllm_trace_reference_on_host(use_8x4_sf_layout, a_scale_rows):
+    from flashinfer.trace.templates.gemm import (
+        _mm_fp4_trtllm_identity_reference,
+        _mm_fp4_trtllm_relu2_value_reference,
+    )
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+    torch.manual_seed(7)
+    m, n, k = 9, 64, 128
+    a_codes = torch.randint(0, 16, (m, k), dtype=torch.int64)
+    weight_codes = torch.randint(0, 16, (n, k), dtype=torch.int64)
+    a = (a_codes[:, 0::2] | (a_codes[:, 1::2] << 4)).to(torch.uint8)
+    weight = (weight_codes[:, 0::2] | (weight_codes[:, 1::2] << 4)).to(torch.uint8)
+    row_indices = get_shuffle_matrix_a_row_indices(weight, 128)
+    weight = weight[row_indices]
+    scale_columns = k // 16
+    a_scale_linear = (
+        torch.arange(m * scale_columns).reshape(m, scale_columns) % 4 + 1
+    ).to(torch.float8_e4m3fn)
+    weight_scale_linear = (
+        torch.arange(n * scale_columns).reshape(n, scale_columns) % 4 + 1
+    ).to(torch.float8_e4m3fn)
+    shuffled_weight_scale = weight_scale_linear[row_indices]
+    weight_scale = torch.zeros(
+        (n + 127) // 128 * 128,
+        (scale_columns + 3) // 4 * 4,
+        dtype=torch.float8_e4m3fn,
+    )
+    weight_row = torch.arange(n, dtype=torch.int64).unsqueeze(1)
+    weight_column = torch.arange(scale_columns, dtype=torch.int64).unsqueeze(0)
+    weight_offsets = (
+        weight_column % 4
+        + (weight_column // 4) * 512
+        + (weight_row % 32) * 16
+        + ((weight_row % 128) // 32) * 4
+        + (weight_row // 128) * (128 * weight_scale.shape[1])
+    )
+    weight_scale.reshape(-1)[weight_offsets] = shuffled_weight_scale
+
+    a_scale = torch.zeros(a_scale_rows, scale_columns, dtype=torch.float8_e4m3fn)
+    row = torch.arange(m, dtype=torch.int64).unsqueeze(1)
+    column = torch.arange(scale_columns, dtype=torch.int64).unsqueeze(0)
+    if use_8x4_sf_layout:
+        offsets = (
+            (row // 8) * (scale_columns // 4) * 32
+            + (column // 4) * 32
+            + (row % 8) * 4
+            + column % 4
+        )
+    else:
+        offsets = (
+            column % 4
+            + (column // 4) * 512
+            + (row % 32) * 16
+            + ((row % 128) // 32) * 4
+            + (row // 128) * (128 * scale_columns)
+        )
+    a_scale.reshape(-1)[offsets] = a_scale_linear
+
+    fp4_values = torch.tensor(
+        (
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        )
+    )
+    a_value = fp4_values[a_codes] * a_scale_linear.float().repeat_interleave(16, dim=1)
+    weight_value = fp4_values[
+        weight_codes
+    ] * weight_scale_linear.float().repeat_interleave(16, dim=1)
+    expected = torch.relu(a_value @ weight_value.T).square()
+    actual = _mm_fp4_trtllm_relu2_value_reference(
+        a,
+        weight.T,
+        a_scale,
+        weight_scale.T,
+        torch.ones(1),
+        use_8x4_sf_layout=use_8x4_sf_layout,
+    )
+
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16))
+    identity = _mm_fp4_trtllm_identity_reference(
+        a,
+        weight.T,
+        a_scale,
+        weight_scale.T,
+        torch.ones(1),
+        use_8x4_sf_layout=use_8x4_sf_layout,
+    )
+    torch.testing.assert_close(identity, (a_value @ weight_value.T).to(torch.bfloat16))
+
+
+def test_trtllm_gemm_trace_dispatch_fallbacks():
+    from flashinfer.trace.templates import gemm
+
+    cases = (
+        (gemm.mm_fp8_trace_dispatch, {}, gemm.mm_fp8_trace),
+        (
+            gemm.mm_fp8_trace_dispatch,
+            {"backend": "trtllm_low_latency", "activation": "relu2"},
+            None,
+        ),
+        (gemm.mm_fp4_trace_dispatch, {}, gemm.mm_fp4_trace),
+        (
+            gemm.mm_fp4_trace_dispatch,
+            {"backend": "auto", "activation": "relu2"},
+            None,
+        ),
+    )
+    for dispatcher, kwargs, expected in cases:
+        assert dispatcher(**kwargs) is expected
+
+
+def test_trtllm_gemm_trace_dispatch_rejects_unsupported_contracts():
+    from flashinfer.trace.templates import gemm
+
+    alpha = object()
+    cases = (
+        (gemm.mm_fp8_trace_dispatch, {"activation": "none", "alpha": None}),
+        (
+            gemm.mm_fp8_trace_dispatch,
+            {
+                "activation": "none",
+                "out_dtype": torch.float8_e4m3fn,
+                "alpha": alpha,
+            },
+        ),
+        (
+            gemm.mm_fp8_trace_dispatch,
+            {"activation": "relu2", "out_dtype": torch.float8_e4m3fn, "alpha": alpha},
+        ),
+        (
+            gemm.mm_fp4_trace_dispatch,
+            {"activation": "none", "out_dtype": torch.uint8, "alpha": alpha},
+        ),
+        (
+            gemm.mm_fp4_trace_dispatch,
+            {
+                "activation": "relu2",
+                "out_dtype": torch.uint8,
+                "alpha": alpha,
+                "output_quant_scale": object(),
+            },
+        ),
+        (
+            gemm.mm_fp4_trace_dispatch,
+            {
+                "activation": "relu2",
+                "out_dtype": torch.uint8,
+                "alpha": alpha,
+                "output_quant_scale": object(),
+                "out_scale": object(),
+                "use_8x4_sf_layout": True,
+            },
+        ),
+        (
+            gemm.mm_fp4_trace_dispatch,
+            {"activation": "relu2", "alpha": alpha, "block_size": 32},
+        ),
+    )
+    for dispatcher, kwargs in cases:
+        assert dispatcher(backend="trtllm", **kwargs) is None
+
+
+def test_mm_fp4_fi_trace_rejects_missing_output_scale():
+    m, n, k = 8, 64, 128
+    assert (
+        flashinfer.mm_fp4.fi_trace(
+            a=torch.empty(m, k // 2, dtype=torch.uint8),
+            b=torch.empty(n, k // 2, dtype=torch.uint8).T,
+            a_descale=torch.empty(128, k // 16, dtype=torch.float8_e4m3fn),
+            b_descale=torch.empty(128, k // 16, dtype=torch.float8_e4m3fn).T,
+            alpha=torch.ones(1, dtype=torch.float32),
+            out_dtype=torch.uint8,
+            out=torch.empty(m, n // 2, dtype=torch.uint8),
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="trtllm",
+            activation="relu2",
+            output_quant_scale=torch.ones(1, dtype=torch.float32),
+            out_scale=None,
+        )
+        == {}
+    )
+
+
 def test_attention_trace_check_tolerances_match_unit_tests():
     from flashinfer.trace.templates.attention import (
         single_decode_with_kv_cache_trace,

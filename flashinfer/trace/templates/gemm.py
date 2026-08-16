@@ -321,6 +321,314 @@ mm_fp8_trace = TraceTemplate(
     init=_mm_fp8_init,
 )
 
+# ── TRTLLM FP8 GEMM variants ────────────────────────────────────────────────
+#
+# The ordinary TRTLLM backend has a different physical weight contract from
+# the low-latency template above. Only explicit backend="trtllm" calls select
+# these activation/output-specific templates.
+
+
+@torch.no_grad()
+def _mm_fp8_trtllm_matmul_reference(a, b, alpha):
+    value = a.to(torch.float32) @ b.to(torch.float32)
+    return value.mul(alpha.to(torch.float32))
+
+
+@torch.no_grad()
+def _mm_fp8_trtllm_identity_reference(a, b, alpha, **_unused):
+    value = _mm_fp8_trtllm_matmul_reference(a, b, alpha)
+    return value.to(torch.bfloat16)
+
+
+@torch.no_grad()
+def _mm_fp8_trtllm_relu2_bf16_reference(a, b, alpha, **_unused):
+    value = _mm_fp8_trtllm_matmul_reference(a, b, alpha)
+    return torch.relu(value).square().to(torch.bfloat16)
+
+
+@torch.no_grad()
+def _mm_fp8_trtllm_relu2_fp8_reference(a, b, alpha, output_quant_scale, **_unused):
+    value = _mm_fp8_trtllm_matmul_reference(a, b, alpha)
+    value = torch.relu(value).square()
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    return (
+        value.mul(output_quant_scale.to(torch.float32))
+        .clamp(finfo.min, finfo.max)
+        .to(torch.float8_e4m3fn)
+    )
+
+
+for _mm_fp8_trtllm_reference in (
+    _mm_fp8_trtllm_identity_reference,
+    _mm_fp8_trtllm_relu2_bf16_reference,
+    _mm_fp8_trtllm_relu2_fp8_reference,
+):
+    cast(Any, _mm_fp8_trtllm_reference)._trace_reference_dependencies = (
+        _mm_fp8_trtllm_matmul_reference,
+    )
+
+
+def _mm_fp8_trtllm_init_impl(
+    *,
+    M: int,
+    K: int,
+    N: int,
+    activation: str,
+    out_dtype: torch.dtype,
+    quantized: bool,
+    device: str,
+    seed: int,
+):
+    """Build the physical static-E4M3 contract consumed by TRTLLM GEMM."""
+
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.02
+    weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.02
+    a, a_inverse_scale = per_tensor_fp8_quantize(a_bf16)
+    weight, weight_inverse_scale = per_tensor_fp8_quantize(weight_bf16)
+    inputs = {
+        "a": a.contiguous(),
+        # Generated ordinary GEMM consumes a column-major [K, N] transpose
+        # view. Keeping the [N, K] storage alive through this view is essential:
+        # a generic row-major [K, N] allocation is not replay-compatible.
+        "b": weight.contiguous().T,
+        "alpha": (a_inverse_scale * weight_inverse_scale).reshape(1),
+        "out_dtype": out_dtype,
+        "out": torch.empty(M, N, dtype=out_dtype, device=device),
+        "backend": "trtllm",
+        "activation": activation,
+    }
+    if quantized:
+        # Inputs are deliberately small enough that a unit multiplier avoids
+        # E4M3 saturation while keeping the replay independent of a reference
+        # GEMM during initialization.
+        inputs["output_quant_scale"] = torch.ones(1, dtype=torch.float32, device=device)
+    return inputs
+
+
+def _mm_fp8_trtllm_identity_bf16_init(
+    *,
+    M: int,
+    K: int = 128,
+    N: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a static-E4M3 identity/down GEMM replay bundle."""
+
+    return _mm_fp8_trtllm_init_impl(
+        M=M,
+        K=K,
+        N=N,
+        activation="none",
+        out_dtype=torch.bfloat16,
+        quantized=False,
+        device=device,
+        seed=seed,
+    )
+
+
+def _mm_fp8_trtllm_relu2_bf16_init(
+    *,
+    M: int,
+    K: int = 128,
+    N: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a static-E4M3 Relu2-to-BF16 replay bundle."""
+
+    return _mm_fp8_trtllm_init_impl(
+        M=M,
+        K=K,
+        N=N,
+        activation="relu2",
+        out_dtype=torch.bfloat16,
+        quantized=False,
+        device=device,
+        seed=seed,
+    )
+
+
+def _mm_fp8_trtllm_relu2_fp8_init(
+    *,
+    M: int,
+    K: int = 128,
+    N: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a static-E4M3 Relu2-to-E4M3 replay bundle."""
+
+    return _mm_fp8_trtllm_init_impl(
+        M=M,
+        K=K,
+        N=N,
+        activation="relu2",
+        out_dtype=torch.float8_e4m3fn,
+        quantized=True,
+        device=device,
+        seed=seed,
+    )
+
+
+for _mm_fp8_trtllm_init in (
+    _mm_fp8_trtllm_identity_bf16_init,
+    _mm_fp8_trtllm_relu2_bf16_init,
+    _mm_fp8_trtllm_relu2_fp8_init,
+):
+    cast(Any, _mm_fp8_trtllm_init)._trace_init_dependencies = (
+        _mm_fp8_trtllm_init_impl,
+    )
+
+
+_MM_FP8_TRTLLM_AXES: dict[str, Var | Const] = {
+    "M": Var(description="Token rows."),
+    "K": Const(abbrev="k", description="Input features."),
+    "N": Const(abbrev="n", description="Output features."),
+    "one": Const(abbrev="", description="One-element scale tensor extent."),
+}
+
+_MM_FP8_TRTLLM_INPUTS = {
+    "A": Tensor(
+        ["M", "K"],
+        param="a",
+        dtype="float8_e4m3fn",
+        description="Row-major static per-tensor E4M3 activations.",
+    ),
+    "B": Tensor(
+        ["K", "N"],
+        param="b",
+        dtype="float8_e4m3fn",
+        description=("Column-major [K, N] transpose view of a row-major E4M3 weight."),
+    ),
+    "alpha": Tensor(
+        ["one"],
+        dtype="float32",
+        description="Combined activation/weight dequantization scalar.",
+    ),
+}
+
+
+def _mm_fp8_trtllm_inputs(*, quantized: bool = False):
+    inputs = dict(_MM_FP8_TRTLLM_INPUTS)
+    if quantized:
+        inputs["output_quant_scale"] = Tensor(
+            ["one"],
+            dtype="float32",
+            description="Static E4M3 producer quantization multiplier.",
+        )
+    return inputs
+
+
+def _make_mm_fp8_trtllm_trace(
+    *,
+    activation: str,
+    out_dtype: torch.dtype,
+    reference,
+    init,
+):
+    quantized = out_dtype == torch.float8_e4m3fn
+    activation_name = "identity" if activation == "none" else activation
+    output_name = "fp8" if quantized else "bf16"
+    descriptions = {
+        ("none", False): (
+            "Static per-tensor E4M3 GEMM with identity activation and BF16 "
+            "output using the generated TRTLLM backend."
+        ),
+        ("relu2", False): (
+            "Static per-tensor E4M3 GEMM with fused Relu2 and BF16 output."
+        ),
+        ("relu2", True): (
+            "Static per-tensor E4M3 GEMM with fused Relu2 and direct static "
+            "E4M3 output quantization."
+        ),
+    }
+    tags = ["status:experimental", "backend:trtllm", f"activation:{activation}"]
+    if quantized:
+        tags.append("quantization:fp8_e4m3")
+    if activation == "relu2":
+        tags.append("fused")
+
+    return TraceTemplate(
+        op_type="gemm_fp8",
+        name_prefix=f"mm_fp8_trtllm_{activation_name}_{output_name}",
+        description=descriptions[(activation, quantized)],
+        axes=dict(_MM_FP8_TRTLLM_AXES),
+        inputs=_mm_fp8_trtllm_inputs(quantized=quantized),
+        outputs={
+            "out": Tensor(
+                ["M", "N"],
+                dtype="float8_e4m3fn" if quantized else "bfloat16",
+                description=(
+                    "Returned E4M3 result, written to out when supplied."
+                    if quantized
+                    else "Returned result, written to out when supplied."
+                ),
+            )
+        },
+        tags=tags,
+        reference=reference,
+        check=_gemm_check,
+        init=init,
+    )
+
+
+mm_fp8_trtllm_identity_bf16_trace = _make_mm_fp8_trtllm_trace(
+    activation="none",
+    out_dtype=torch.bfloat16,
+    reference=_mm_fp8_trtllm_identity_reference,
+    init=_mm_fp8_trtllm_identity_bf16_init,
+)
+mm_fp8_trtllm_relu2_bf16_trace = _make_mm_fp8_trtllm_trace(
+    activation="relu2",
+    out_dtype=torch.bfloat16,
+    reference=_mm_fp8_trtllm_relu2_bf16_reference,
+    init=_mm_fp8_trtllm_relu2_bf16_init,
+)
+mm_fp8_trtllm_relu2_fp8_trace = _make_mm_fp8_trtllm_trace(
+    activation="relu2",
+    out_dtype=torch.float8_e4m3fn,
+    reference=_mm_fp8_trtllm_relu2_fp8_reference,
+    init=_mm_fp8_trtllm_relu2_fp8_init,
+)
+
+_MM_FP8_TRTLLM_TRACE_BY_CONTRACT = {
+    ("none", torch.bfloat16, False): mm_fp8_trtllm_identity_bf16_trace,
+    ("relu2", torch.bfloat16, False): mm_fp8_trtllm_relu2_bf16_trace,
+    ("relu2", torch.float8_e4m3fn, True): mm_fp8_trtllm_relu2_fp8_trace,
+}
+
+
+def mm_fp8_trace_dispatch(**kwargs):
+    """Select a generated-GEMM trace only for an explicit TRTLLM call."""
+
+    if kwargs.get("backend", "trtllm_low_latency") != "trtllm":
+        if (
+            kwargs.get("activation", "none") != "none"
+            or kwargs.get("output_quant_scale") is not None
+        ):
+            return None
+        return mm_fp8_trace
+    if kwargs.get("alpha") is None:
+        return None
+
+    activation = kwargs.get("activation", "none")
+    out_dtype = kwargs.get("out_dtype", torch.bfloat16)
+    # An explicit TRTLLM call is a different physical contract from the
+    # legacy mm_fp8 template.  Suppress the trace when that generated contract
+    # is unsupported rather than emitting a replay definition for the wrong
+    # backend/layout.
+    return _MM_FP8_TRTLLM_TRACE_BY_CONTRACT.get(
+        (activation, out_dtype, kwargs.get("output_quant_scale") is not None)
+    )
+
+
+mm_fp8_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_fp8_trace,
+    *_MM_FP8_TRTLLM_TRACE_BY_CONTRACT.values(),
+]
+
 # ── MXFP8 GEMM ───────────────────────────────────────────────────────────────
 
 
@@ -497,6 +805,744 @@ mm_fp4_trace = TraceTemplate(
     init=_mm_fp4_init,
 )
 
+
+# ── TRTLLM FP4 GEMM variants ────────────────────────────────────────────────
+#
+# Only explicit backend="trtllm" calls select these prepared-NVFP4
+# activation/output-specific templates; other backends retain mm_fp4_trace.
+
+
+@torch.no_grad()
+def _mm_fp4_trtllm_matmul_reference(
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    block_size=16,
+    use_8x4_sf_layout=False,
+    **_unused,
+):
+    """Dequantize TRTLLM-prepared NVFP4 operands and compute A @ B."""
+
+    fp4_values = torch.tensor(
+        (
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ),
+        dtype=torch.float32,
+        device=a.device,
+    )
+
+    def unpack_fp4(packed):
+        packed = packed.to(torch.int64)
+        codes = torch.stack([packed & 0xF, (packed >> 4) & 0xF], dim=-1)
+        return fp4_values[codes.reshape(packed.shape[0], -1)]
+
+    def unswizzle_scale(scale, rows, columns, row_tile):
+        padded_columns = (columns + 3) // 4 * 4
+        row = torch.arange(rows, dtype=torch.int64, device=scale.device).unsqueeze(1)
+        column = torch.arange(
+            columns, dtype=torch.int64, device=scale.device
+        ).unsqueeze(0)
+        if row_tile == 8:
+            offsets = (
+                (row // 8) * (padded_columns // 4) * 32
+                + (column // 4) * 32
+                + (row % 8) * 4
+                + column % 4
+            )
+        else:
+            offsets = (
+                column % 4
+                + (column // 4) * 512
+                + (row % 32) * 16
+                + ((row % 128) // 32) * 4
+                + (row // 128) * (128 * padded_columns)
+            )
+        return scale.reshape(-1)[offsets]
+
+    def unshuffle_weight_rows(shuffled):
+        from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+        row_indices = get_shuffle_matrix_a_row_indices(shuffled, 128).to(
+            shuffled.device
+        )
+        unshuffled = torch.empty_like(shuffled)
+        unshuffled[row_indices] = shuffled
+        return unshuffled
+
+    m, k_packed = a.shape
+    k = k_packed * 2
+    scale_columns = k // block_size
+    a_scale = (
+        unswizzle_scale(
+            a_descale,
+            m,
+            scale_columns,
+            8 if use_8x4_sf_layout else 128,
+        )
+        .view(torch.uint8)
+        .view(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    a_value = unpack_fp4(a) * a_scale.repeat_interleave(block_size, dim=1)
+
+    weight = unshuffle_weight_rows(b.T.contiguous())
+    shuffled_weight_scale = unswizzle_scale(
+        b_descale.T.contiguous(),
+        weight.shape[0],
+        scale_columns,
+        128,
+    )
+    weight_scale = (
+        unshuffle_weight_rows(shuffled_weight_scale)
+        .view(torch.uint8)
+        .view(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    weight_value = unpack_fp4(weight) * weight_scale.repeat_interleave(
+        block_size, dim=1
+    )
+    return (a_value @ weight_value.T).mul(alpha.to(torch.float32))
+
+
+@torch.no_grad()
+def _mm_fp4_trtllm_identity_reference(
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    block_size=16,
+    use_8x4_sf_layout=False,
+    **kwargs,
+):
+    value = _mm_fp4_trtllm_matmul_reference(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        block_size=block_size,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        **kwargs,
+    )
+    return value.to(torch.bfloat16)
+
+
+@torch.no_grad()
+def _mm_fp4_trtllm_relu2_value_reference(
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    block_size=16,
+    use_8x4_sf_layout=False,
+    **kwargs,
+):
+    value = _mm_fp4_trtllm_matmul_reference(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        block_size=block_size,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        **kwargs,
+    )
+    return torch.relu(value).square().to(torch.bfloat16)
+
+
+for _mm_fp4_trtllm_reference in (
+    _mm_fp4_trtllm_identity_reference,
+    _mm_fp4_trtllm_relu2_value_reference,
+):
+    cast(Any, _mm_fp4_trtllm_reference)._trace_reference_dependencies = (
+        _mm_fp4_trtllm_matmul_reference,
+    )
+
+
+@torch.no_grad()
+def _mm_fp4_trtllm_relu2_nvfp4_reference(
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    output_quant_scale,
+    block_size=16,
+    use_8x4_sf_layout=False,
+    **kwargs,
+):
+    from flashinfer import nvfp4_quantize
+    from flashinfer.quantization.fp4_quantization import SfLayout
+
+    value = _mm_fp4_trtllm_relu2_value_reference(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        block_size=block_size,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        **kwargs,
+    )
+    packed, scale = nvfp4_quantize(
+        value,
+        output_quant_scale,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+    )
+    # ``nvfp4_quantize`` returns the physical UE4M3 bytes as uint8.  The trace
+    # declares the scale output as E4M3, so its reference must honor that
+    # contract.
+    scale = scale.view(torch.float8_e4m3fn)
+    return packed, scale
+
+
+cast(Any, _mm_fp4_trtllm_relu2_nvfp4_reference)._trace_reference_dependencies = (
+    _mm_fp4_trtllm_matmul_reference,
+    _mm_fp4_trtllm_relu2_value_reference,
+)
+
+
+def _mm_fp4_trtllm_init_impl(
+    *,
+    M: int,
+    K_packed: int,
+    N: int,
+    use_8x4_sf_layout: bool,
+    activation: str,
+    quantized: bool,
+    device: str,
+    seed: int,
+):
+    """Build packed values and physical scale layouts for TRTLLM NVFP4."""
+
+    if str(device).startswith("cpu"):
+        raise NotImplementedError("TRTLLM NVFP4 trace init requires CUDA")
+
+    from flashinfer import SfLayout, nvfp4_quantize  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    K = K_packed * 2
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.02
+    weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.02
+    a_multiplier = torch.tensor(
+        [448.0 * 6.0], dtype=torch.float32, device=device
+    ) / a_bf16.float().abs().amax().clamp_min(1e-6)
+    weight_multiplier = torch.tensor(
+        [448.0 * 6.0], dtype=torch.float32, device=device
+    ) / weight_bf16.float().abs().amax().clamp_min(1e-6)
+    input_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
+    a, a_descale = nvfp4_quantize(
+        a_bf16,
+        a_multiplier,
+        sfLayout=input_layout,
+        do_shuffle=False,
+    )
+    weight, weight_descale = nvfp4_quantize(
+        weight_bf16,
+        weight_multiplier,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=True,
+    )
+    # nvfp4_quantize returns raw UE4M3 scale bytes.  Reinterpret those bytes
+    # so replay inputs match the trace's declared E4M3 physical contract.
+    a_descale = a_descale.view(torch.float8_e4m3fn)
+    weight_descale = weight_descale.view(torch.float8_e4m3fn)
+    out_dtype = torch.uint8 if quantized else torch.bfloat16
+    inputs = {
+        "a": a.contiguous(),
+        # Both tensors stay transpose views of contiguous shuffled [N, K/2]
+        # and [N_padded, K_scale] storage, matching the public TRTLLM checks.
+        "b": weight.contiguous().T,
+        "a_descale": a_descale,
+        "b_descale": weight_descale.contiguous().T,
+        "alpha": (a_multiplier * weight_multiplier).reciprocal().reshape(1),
+        "out_dtype": out_dtype,
+        "out": torch.empty(
+            M, N // 2 if quantized else N, dtype=out_dtype, device=device
+        ),
+        "block_size": 16,
+        "use_8x4_sf_layout": use_8x4_sf_layout,
+        "backend": "trtllm",
+        "use_nvfp4": True,
+        "activation": activation,
+    }
+    if quantized:
+        reference = torch.relu(a_bf16.float() @ weight_bf16.float().T).square()
+        output_quant_scale = torch.tensor(
+            [448.0 * 6.0], dtype=torch.float32, device=device
+        ) / reference.abs().amax().clamp_min(1e-6)
+        inputs.update(
+            output_quant_scale=output_quant_scale.reshape(1),
+            # Generated kernels leave scale entries for padded rows unspecified.
+            # Zero initialization keeps those unobserved entries deterministic
+            # in standalone trace replays without changing the logical output.
+            out_scale=torch.zeros(
+                (M + 127) // 128 * 128,
+                (N // 16 + 3) // 4 * 4,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            ),
+        )
+    return inputs
+
+
+def _mm_fp4_trtllm_identity_bf16_r128c4_init(
+    *,
+    M: int,
+    A_scale_rows: int,
+    K_packed: int = 64,
+    N: int = 128,
+    K_scale: int = 0,
+    N_padded: int = 0,
+    block_size: int = 16,
+    use_8x4_sf_layout: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an R128c4 NVFP4 identity-to-BF16 replay bundle."""
+
+    return _mm_fp4_trtllm_init_impl(
+        M=M,
+        K_packed=K_packed,
+        N=N,
+        use_8x4_sf_layout=False,
+        activation="none",
+        quantized=False,
+        device=device,
+        seed=seed,
+    )
+
+
+def _mm_fp4_trtllm_relu2_bf16_r128c4_init(
+    *,
+    M: int,
+    A_scale_rows: int,
+    K_packed: int = 64,
+    N: int = 128,
+    K_scale: int = 0,
+    N_padded: int = 0,
+    block_size: int = 16,
+    use_8x4_sf_layout: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an R128c4 NVFP4 Relu2-to-BF16 replay bundle."""
+
+    return _mm_fp4_trtllm_init_impl(
+        M=M,
+        K_packed=K_packed,
+        N=N,
+        use_8x4_sf_layout=False,
+        activation="relu2",
+        quantized=False,
+        device=device,
+        seed=seed,
+    )
+
+
+def _mm_fp4_trtllm_relu2_bf16_r8c4_init(
+    *,
+    M: int,
+    A_scale_rows: int,
+    K_packed: int = 64,
+    N: int = 128,
+    K_scale: int = 0,
+    N_padded: int = 0,
+    block_size: int = 16,
+    use_8x4_sf_layout: int = 1,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an R8c4 NVFP4 Relu2-to-BF16 replay bundle."""
+
+    return _mm_fp4_trtllm_init_impl(
+        M=M,
+        K_packed=K_packed,
+        N=N,
+        use_8x4_sf_layout=True,
+        activation="relu2",
+        quantized=False,
+        device=device,
+        seed=seed,
+    )
+
+
+def _mm_fp4_trtllm_relu2_nvfp4_r128c4_init(
+    *,
+    M: int,
+    A_scale_rows: int,
+    N_packed: int,
+    M_scale: int,
+    K_packed: int = 64,
+    N: int = 128,
+    K_scale: int = 0,
+    N_padded: int = 0,
+    block_size: int = 16,
+    use_8x4_sf_layout: int = 0,
+    one: int = 1,
+    N_scale: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an R128c4 NVFP4 Relu2-to-NVFP4 replay bundle."""
+
+    return _mm_fp4_trtllm_init_impl(
+        M=M,
+        K_packed=K_packed,
+        N=N,
+        use_8x4_sf_layout=False,
+        activation="relu2",
+        quantized=True,
+        device=device,
+        seed=seed,
+    )
+
+
+for _mm_fp4_trtllm_init in (
+    _mm_fp4_trtllm_identity_bf16_r128c4_init,
+    _mm_fp4_trtllm_relu2_bf16_r128c4_init,
+    _mm_fp4_trtllm_relu2_bf16_r8c4_init,
+    _mm_fp4_trtllm_relu2_nvfp4_r128c4_init,
+):
+    cast(Any, _mm_fp4_trtllm_init)._trace_init_dependencies = (
+        _mm_fp4_trtllm_init_impl,
+    )
+
+
+def _mm_fp4_trtllm_axes(
+    *,
+    use_8x4_sf_layout: bool,
+    quantized: bool,
+):
+    layout = "R8c4" if use_8x4_sf_layout else "R128c4"
+    axes = {
+        "M": Var(description="Token rows."),
+        "K_packed": Const(
+            abbrev="kp", description="Packed E2M1 K storage (logical K / 2)."
+        ),
+        "N": Const(abbrev="n", description="Physical output features."),
+        "A_scale_rows": Var(description=f"Physical {layout} activation-scale rows."),
+        "K_scale": Const(
+            abbrev="",
+            description="Physical K scale columns, padded to a multiple of 4.",
+        ),
+        "N_padded": Const(
+            abbrev="", description="Physical weight-scale rows, padded to 128."
+        ),
+        "block_size": Const(
+            abbrev="bs",
+            description="NVFP4 scale block size; generated kernels require 16.",
+        ),
+        "use_8x4_sf_layout": Const(
+            abbrev="",
+            description="1 for R8c4 activation scales, 0 for R128c4.",
+        ),
+        "one": Const(abbrev="", description="One-element scale tensor extent."),
+    }
+    if quantized:
+        axes.update(
+            {
+                "N_packed": Var(description="Packed output columns (N / 2)."),
+                "M_scale": Var(description="R128c4 output-scale rows."),
+                "N_scale": Var(description="R128c4 output-scale columns."),
+            }
+        )
+    return axes
+
+
+def _mm_fp4_trtllm_inputs(
+    *,
+    use_8x4_sf_layout: bool,
+    quantized: bool = False,
+):
+    layout = "R8c4" if use_8x4_sf_layout else "R128c4"
+    inputs = {
+        "A": Tensor(
+            ["M", "K_packed"],
+            param="a",
+            dtype="uint8",
+            description="Row-major packed NVFP4 E2M1 activations.",
+        ),
+        "B": Tensor(
+            ["K_packed", "N"],
+            param="b",
+            dtype="uint8",
+            description=(
+                "Column-major [K/2, N] view of a TRTLLM-shuffled packed weight."
+            ),
+        ),
+        "a_descale": Tensor(
+            ["A_scale_rows", "K_scale"],
+            dtype="float8_e4m3fn",
+            description=f"Prepared {layout} NVFP4 activation block scales.",
+        ),
+        "b_descale": Tensor(
+            ["K_scale", "N_padded"],
+            dtype="float8_e4m3fn",
+            description=(
+                "Transpose view of the TRTLLM-shuffled weight-scale buffer; "
+                "b_descale.T is contiguous."
+            ),
+        ),
+        "alpha": Tensor(
+            ["one"],
+            dtype="float32",
+            description="Combined activation/weight global decode multiplier.",
+        ),
+        "block_size": Scalar("int32", description="NVFP4 block size (16)."),
+        "use_8x4_sf_layout": Scalar(
+            "bool",
+            description=f"Selects the {layout} activation-scale layout.",
+        ),
+    }
+    if quantized:
+        inputs.update(
+            {
+                "output_quant_scale": Tensor(
+                    ["one"],
+                    dtype="float32",
+                    description="NVFP4 producer quantization multiplier.",
+                ),
+            }
+        )
+    return inputs
+
+
+def _mm_fp4_trtllm_constraints(*, use_8x4_sf_layout: bool, quantized: bool):
+    row_tile = 8 if use_8x4_sf_layout else 128
+    constraints = [
+        "block_size == 16",
+        f"use_8x4_sf_layout == {int(use_8x4_sf_layout)}",
+        "K_packed * 2 % (4 * block_size) == 0",
+        f"A_scale_rows == ((M + {row_tile - 1}) // {row_tile}) * {row_tile}",
+        "K_scale == ((((K_packed * 2) // block_size) + 3) // 4) * 4",
+        "N_padded == ((N + 127) // 128) * 128",
+        "one == 1",
+    ]
+    if quantized:
+        constraints.extend(
+            [
+                "N % (4 * block_size) == 0",
+                "N_packed == N // 2",
+                "M_scale == ((M + 127) // 128) * 128",
+                "N_scale == (((N // block_size) + 3) // 4) * 4",
+            ]
+        )
+    return constraints
+
+
+mm_fp4_trtllm_identity_bf16_r128c4_trace = TraceTemplate(
+    op_type="gemm_fp4",
+    name_prefix="mm_fp4_trtllm_identity_bf16_r128c4",
+    description=(
+        "NVFP4 GEMM with R128c4 input/weight scales, identity activation, "
+        "and BF16 output."
+    ),
+    axes=_mm_fp4_trtllm_axes(
+        use_8x4_sf_layout=False,
+        quantized=False,
+    ),
+    inputs=_mm_fp4_trtllm_inputs(
+        use_8x4_sf_layout=False,
+        quantized=False,
+    ),
+    outputs={
+        "out": Tensor(
+            ["M", "N"],
+            dtype="bfloat16",
+            description="Returned result, written to out when supplied.",
+        )
+    },
+    constraints=_mm_fp4_trtllm_constraints(
+        use_8x4_sf_layout=False,
+        quantized=False,
+    ),
+    tags=[
+        "status:experimental",
+        "backend:trtllm",
+        "activation:none",
+        "input:nvfp4",
+        "input_scale_layout:r128c4",
+    ],
+    reference=_mm_fp4_trtllm_identity_reference,
+    check=_fp4_gemm_check,
+    init=_mm_fp4_trtllm_identity_bf16_r128c4_init,
+)
+
+
+def _make_mm_fp4_trtllm_relu2_trace(*, use_8x4_sf_layout: bool, quantized: bool):
+    layout = "r8c4" if use_8x4_sf_layout else "r128c4"
+    output = "nvfp4" if quantized else "bf16"
+    init: Any
+    if quantized:
+        init = _mm_fp4_trtllm_relu2_nvfp4_r128c4_init
+    elif use_8x4_sf_layout:
+        init = _mm_fp4_trtllm_relu2_bf16_r8c4_init
+    else:
+        init = _mm_fp4_trtllm_relu2_bf16_r128c4_init
+    outputs: dict[str, Tensor | Scalar] = {
+        "out": Tensor(
+            ["M", "N_packed" if quantized else "N"],
+            dtype="uint8" if quantized else "bfloat16",
+            description=(
+                "Returned packed E2M1 result, written to out when supplied."
+                if quantized
+                else "Returned result, written to out when supplied."
+            ),
+        )
+    }
+    if quantized:
+        outputs["out_scale"] = Tensor(
+            ["M_scale", "N_scale"],
+            dtype="float8_e4m3fn",
+            description="R128c4 E4M3 scale output.",
+        )
+
+    return TraceTemplate(
+        op_type="gemm_fp4",
+        name_prefix=f"mm_fp4_trtllm_relu2_{output}_{layout}",
+        description=(
+            f"NVFP4 GEMM with {layout.upper()} activation scales, fused Relu2, "
+            + (
+                "and direct packed NVFP4 output plus a required R128c4 E4M3 "
+                "scale sidecar."
+                if quantized
+                else "and BF16 output."
+            )
+        ),
+        axes=_mm_fp4_trtllm_axes(
+            use_8x4_sf_layout=use_8x4_sf_layout, quantized=quantized
+        ),
+        inputs=_mm_fp4_trtllm_inputs(
+            use_8x4_sf_layout=use_8x4_sf_layout,
+            quantized=quantized,
+        ),
+        outputs=outputs,
+        constraints=_mm_fp4_trtllm_constraints(
+            use_8x4_sf_layout=use_8x4_sf_layout, quantized=quantized
+        ),
+        tags=[
+            "status:experimental",
+            "backend:trtllm",
+            "activation:relu2",
+            "input:nvfp4",
+            f"input_scale_layout:{layout}",
+            *(
+                ["quantization:nvfp4", "output_scale_layout:r128c4"]
+                if quantized
+                else []
+            ),
+            "fused",
+        ],
+        reference=(
+            _mm_fp4_trtllm_relu2_nvfp4_reference
+            if quantized
+            else _mm_fp4_trtllm_relu2_value_reference
+        ),
+        check=_fp4_gemm_check,
+        init=init,
+    )
+
+
+mm_fp4_trtllm_relu2_bf16_r128c4_trace = _make_mm_fp4_trtllm_relu2_trace(
+    use_8x4_sf_layout=False, quantized=False
+)
+mm_fp4_trtllm_relu2_bf16_r8c4_trace = _make_mm_fp4_trtllm_relu2_trace(
+    use_8x4_sf_layout=True, quantized=False
+)
+mm_fp4_trtllm_relu2_nvfp4_r128c4_trace = _make_mm_fp4_trtllm_relu2_trace(
+    use_8x4_sf_layout=False, quantized=True
+)
+
+
+def mm_fp4_trace_dispatch(**kwargs):
+    """Select a generated-GEMM trace only for an explicit TRTLLM call."""
+
+    if kwargs.get("backend", "auto") != "trtllm":
+        if (
+            kwargs.get("activation", "none") != "none"
+            or kwargs.get("output_quant_scale") is not None
+            or kwargs.get("out_scale") is not None
+        ):
+            return None
+        return mm_fp4_trace
+
+    activation = kwargs.get("activation", "none")
+    out_dtype = kwargs.get("out_dtype", torch.bfloat16)
+    output_quant_scale = kwargs.get("output_quant_scale")
+    out_scale = kwargs.get("out_scale")
+    if (
+        activation == "none"
+        and out_dtype == torch.bfloat16
+        and output_quant_scale is None
+        and out_scale is None
+    ):
+        if (
+            kwargs.get("use_nvfp4", True)
+            and kwargs.get("block_size", 16) == 16
+            and kwargs.get("alpha") is not None
+            and not kwargs.get("use_8x4_sf_layout", False)
+        ):
+            return mm_fp4_trtllm_identity_bf16_r128c4_trace
+        return None
+    if not kwargs.get("use_nvfp4", True) or kwargs.get("block_size", 16) != 16:
+        return None
+    if kwargs.get("alpha") is None:
+        return None
+
+    use_8x4_sf_layout = bool(kwargs.get("use_8x4_sf_layout", False))
+    if (
+        activation == "relu2"
+        and out_dtype == torch.bfloat16
+        and output_quant_scale is None
+        and out_scale is None
+    ):
+        return (
+            mm_fp4_trtllm_relu2_bf16_r8c4_trace
+            if use_8x4_sf_layout
+            else mm_fp4_trtllm_relu2_bf16_r128c4_trace
+        )
+    if (
+        activation == "relu2"
+        and out_dtype == torch.uint8
+        and output_quant_scale is not None
+        and out_scale is not None
+        and not use_8x4_sf_layout
+    ):
+        return mm_fp4_trtllm_relu2_nvfp4_r128c4_trace
+    return None
+
+
+mm_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_fp4_trace,
+    mm_fp4_trtllm_identity_bf16_r128c4_trace,
+    mm_fp4_trtllm_relu2_bf16_r128c4_trace,
+    mm_fp4_trtllm_relu2_bf16_r8c4_trace,
+    mm_fp4_trtllm_relu2_nvfp4_r128c4_trace,
+]
 
 # ── BF16 x FP4 GEMM (mm_bf16_fp4, weight-only) ──────────────────────────────
 #
