@@ -17,8 +17,38 @@ from flashinfer.utils import (
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
+def _skip_if_trtllm_unsupported():
+    device = torch.device("cuda")
+    major, minor = get_compute_capability(device)
+    compute_capability = major * 10 + minor
+    if not mm_fp4.is_backend_supported("trtllm", compute_capability):
+        pytest.skip(
+            "Skipping test for trtllm because it is not supported on compute "
+            f"capability {compute_capability}."
+        )
+
+
+def _quantize_nvfp4(value, *, shuffle, layout=SfLayout.layout_128x4):
+    global_scale = ((448 * 6) / value.float().abs().amax().clamp_min(1e-6)).reshape(1)
+    quantized, block_scale = nvfp4_quantize(
+        value,
+        global_scale,
+        sfLayout=layout,
+        do_shuffle=shuffle,
+    )
+    return quantized, block_scale, global_scale
+
+
 def _test_mm_fp4(
-    m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+    m,
+    n,
+    k,
+    res_dtype,
+    backend,
+    use_128x4_sf_layout,
+    auto_tuning,
+    fp4_type,
+    activation="none",
 ):
     use_nvfp4 = fp4_type == "nvfp4"
 
@@ -83,6 +113,8 @@ def _test_mm_fp4(
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if has_alpha else None
 
     reference = torch.mm(input, mat2.T)
+    if activation == "relu2":
+        reference = torch.relu(reference).square()
 
     res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
@@ -101,6 +133,7 @@ def _test_mm_fp4(
                 backend=backend,
                 use_nvfp4=use_nvfp4,
                 skip_check=False,
+                activation=activation,
             )
 
         cos_sim = F.cosine_similarity(
@@ -272,6 +305,267 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
             backend="cute-dsl",
             use_nvfp4=True,
             skip_check=False,
+        )
+
+
+def test_mm_fp4_trtllm_requires_alpha():
+    _skip_if_trtllm_unsupported()
+    device = torch.device("cuda")
+
+    a = torch.empty((1, 64), dtype=torch.uint8, device=device)
+    b = torch.empty((64, 64), dtype=torch.uint8, device=device)
+    scale = torch.empty((1, 4), dtype=torch.uint8, device=device)
+
+    with pytest.raises(ValueError, match="backend='trtllm' requires alpha"):
+        mm_fp4(
+            a,
+            b,
+            scale,
+            scale,
+            backend="trtllm",
+            activation="relu2",
+        )
+
+
+@pytest.mark.parametrize("backend", ["auto", "cutlass"])
+def test_mm_fp4_quantized_output_requires_trtllm(backend):
+    device = torch.device("cuda")
+    a = torch.empty((1, 64), dtype=torch.uint8, device=device)
+    b = torch.empty((64, 64), dtype=torch.uint8, device=device)
+    scale = torch.empty((1, 4), dtype=torch.uint8, device=device)
+
+    with pytest.raises(
+        ValueError, match="packed NVFP4 output requires explicit backend='trtllm'"
+    ):
+        mm_fp4(
+            a,
+            b,
+            scale,
+            scale,
+            torch.ones(1, dtype=torch.float32, device=device),
+            out_dtype=torch.uint8,
+            backend=backend,
+            activation="relu2",
+            skip_check=True,
+        )
+
+
+def test_mm_fp4_trtllm_relu2():
+    _test_mm_fp4(
+        m=8,
+        n=128,
+        k=128,
+        res_dtype=torch.bfloat16,
+        backend="trtllm",
+        use_128x4_sf_layout=True,
+        auto_tuning=False,
+        fp4_type="nvfp4",
+        activation="relu2",
+    )
+
+
+def test_mm_fp4_trtllm_quantized_output_is_gemm_input():
+    _skip_if_trtllm_unsupported()
+    device = torch.device("cuda")
+    torch.manual_seed(1235)
+    m, intermediate_size, hidden_size = 8, 128, 128
+    a_bf16 = torch.randn((m, hidden_size), dtype=torch.bfloat16, device=device) / (
+        hidden_size**0.25
+    )
+    up_weight_bf16 = torch.randn(
+        (intermediate_size, hidden_size), dtype=torch.bfloat16, device=device
+    ) / (hidden_size**0.25)
+    a, a_scale, a_global_scale = _quantize_nvfp4(a_bf16, shuffle=False)
+    up_weight, up_weight_scale, up_weight_global_scale = _quantize_nvfp4(
+        up_weight_bf16, shuffle=True
+    )
+    up_alpha = (a_global_scale * up_weight_global_scale).reciprocal()
+    expected_up = torch.relu(a_bf16.float() @ up_weight_bf16.float().T).square()
+    output_quant_scale = ((448 * 6) / expected_up.abs().amax().clamp_min(1e-6)).reshape(
+        1
+    )
+    up_out = torch.empty((m, intermediate_size // 2), dtype=torch.uint8, device=device)
+    up_out_scale = torch.empty(
+        ((m + 127) // 128 * 128, (intermediate_size // 16 + 3) // 4 * 4),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+
+    up_result = mm_fp4(
+        a,
+        up_weight.T,
+        a_scale,
+        up_weight_scale.T,
+        up_alpha,
+        out_dtype=torch.uint8,
+        out=up_out,
+        backend="trtllm",
+        activation="relu2",
+        output_quant_scale=output_quant_scale,
+        out_scale=up_out_scale,
+    )
+
+    down_weight_bf16 = torch.randn(
+        (hidden_size, intermediate_size), dtype=torch.bfloat16, device=device
+    ) / (intermediate_size**0.25)
+    down_weight, down_weight_scale, down_weight_global_scale = _quantize_nvfp4(
+        down_weight_bf16, shuffle=True
+    )
+    down_alpha = (output_quant_scale * down_weight_global_scale).reciprocal()
+    down_out = torch.empty((m, hidden_size), dtype=torch.bfloat16, device=device)
+    down_result = mm_fp4(
+        up_out,
+        down_weight.T,
+        up_out_scale,
+        down_weight_scale.T,
+        down_alpha,
+        out=down_out,
+        backend="trtllm",
+    )
+    expected_down = expected_up @ down_weight_bf16.float().T
+
+    assert up_result.data_ptr() == up_out.data_ptr()
+    assert down_result.data_ptr() == down_out.data_ptr()
+    cosine = F.cosine_similarity(
+        down_result.float().reshape(-1), expected_down.reshape(-1), dim=0
+    )
+    assert cosine > 0.97
+
+
+def test_mm_fp4_trtllm_quantized_output_cuda_graph():
+    _skip_if_trtllm_unsupported()
+    device = torch.device("cuda")
+    torch.manual_seed(1236)
+    m, n, k = 8, 128, 128
+    a_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device=device) / (k**0.25)
+    b_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device=device) / (k**0.25)
+    a, a_scale, a_global_scale = _quantize_nvfp4(a_bf16, shuffle=False)
+    b, b_scale, b_global_scale = _quantize_nvfp4(b_bf16, shuffle=True)
+    alpha = (a_global_scale * b_global_scale).reciprocal()
+    expected = torch.relu(a_bf16.float() @ b_bf16.float().T).square()
+    output_quant_scale = ((448 * 6) / expected.abs().amax().clamp_min(1e-6)).reshape(1)
+    out = torch.empty((m, n // 2), dtype=torch.uint8, device=device)
+    out_scale = torch.empty(
+        ((m + 127) // 128 * 128, (n // 16 + 3) // 4 * 4),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+
+    def run(destination, destination_scale):
+        return mm_fp4(
+            a,
+            b.T,
+            a_scale,
+            b_scale.T,
+            alpha,
+            out_dtype=torch.uint8,
+            out=destination,
+            backend="trtllm",
+            activation="relu2",
+            output_quant_scale=output_quant_scale,
+            out_scale=destination_scale,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run(out, out_scale)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = run(out, out_scale)
+
+    a_new_bf16 = torch.randn_like(a_bf16) / (k**0.25)
+    a_new, a_scale_new = nvfp4_quantize(
+        a_new_bf16,
+        a_global_scale,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+    )
+    a.copy_(a_new)
+    a_scale.copy_(a_scale_new)
+    out.zero_()
+    out_scale.view(torch.uint8).zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    eager_out = torch.zeros_like(out)
+    eager_out_scale = torch.zeros_like(out_scale)
+    eager_result = run(eager_out, eager_out_scale)
+    torch.cuda.synchronize()
+
+    assert graph_result.data_ptr() == out.data_ptr()
+    assert eager_result.data_ptr() == eager_out.data_ptr()
+    assert torch.equal(out, eager_out)
+    assert torch.equal(out_scale.view(torch.uint8), eager_out_scale.view(torch.uint8))
+
+
+def test_mm_fp4_trtllm_rejects_invalid_quantized_output_metadata():
+    _skip_if_trtllm_unsupported()
+    device = torch.device("cuda")
+    torch.manual_seed(1237)
+    m, n, k = 1, 128, 128
+    a_bf16 = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn((n, k), dtype=torch.bfloat16, device=device)
+    a, a_scale, a_global_scale = _quantize_nvfp4(a_bf16, shuffle=False)
+    a_r8, a_scale_r8, a_r8_global_scale = _quantize_nvfp4(
+        a_bf16,
+        shuffle=False,
+        layout=SfLayout.layout_8x4,
+    )
+    b, b_scale, b_global_scale = _quantize_nvfp4(b_bf16, shuffle=True)
+    alpha = (a_global_scale * b_global_scale).reciprocal()
+    output_quant_scale = torch.ones(1, dtype=torch.float32, device=device)
+    out = torch.empty((m, n // 2), dtype=torch.uint8, device=device)
+    out_scale = torch.empty((128, n // 16), dtype=torch.float8_e4m3fn, device=device)
+
+    with pytest.raises(ValueError, match="R128c4 input, weight, and output"):
+        mm_fp4(
+            a_r8,
+            b.T,
+            a_scale_r8,
+            b_scale.T,
+            (a_r8_global_scale * b_global_scale).reciprocal(),
+            out_dtype=torch.uint8,
+            backend="trtllm",
+            use_8x4_sf_layout=True,
+            activation="relu2",
+            output_quant_scale=output_quant_scale,
+            out_scale=out_scale,
+        )
+
+    with pytest.raises(ValueError, match="packed NVFP4 out must have shape"):
+        mm_fp4(
+            a,
+            b.T,
+            a_scale,
+            b_scale.T,
+            alpha,
+            out_dtype=torch.uint8,
+            out=torch.empty((m, n), dtype=torch.uint8, device=device),
+            backend="trtllm",
+            activation="relu2",
+            output_quant_scale=output_quant_scale,
+            out_scale=out_scale,
+        )
+
+    with pytest.raises(ValueError, match="packed NVFP4 out_scale must have shape"):
+        mm_fp4(
+            a,
+            b.T,
+            a_scale,
+            b_scale.T,
+            alpha,
+            out_dtype=torch.uint8,
+            out=out,
+            backend="trtllm",
+            activation="relu2",
+            output_quant_scale=output_quant_scale,
+            out_scale=torch.empty(
+                (128, n // 16 + 4), dtype=torch.float8_e4m3fn, device=device
+            ),
         )
 
 

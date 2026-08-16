@@ -145,6 +145,21 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     return normalize_activation_type(activation_type) in _GATED_ACTIVATION_TYPES
 
 
+# Please keep the values in sync with gemm::gemm::EltwiseActType from
+# flashinfer/trtllm/gemm/trtllmGen_gemm_export/Enums.h.
+class GemmActivationType(IntEnum):
+    None_ = 0
+    Relu2 = 2
+
+
+# Please keep the values in sync with TrtllmGemmOperandLayout from
+# csrc/trtllm_gemm_runner.cu.
+class TrtllmGemmOperandLayout(IntEnum):
+    Standard = 0
+    ShuffledTransposed = 1
+    UnshuffledTransposed = 2
+
+
 class DtypeTrtllmGen(IntEnum):
     def __new__(cls, block_format_bit, signed_bit, integer_bit, num_bits, uid):
         value = (

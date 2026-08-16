@@ -97,7 +97,12 @@ from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
-from ..tllm_enums import DtypeTrtllmGen, SfLayout
+from ..tllm_enums import (
+    DtypeTrtllmGen,
+    GemmActivationType,
+    SfLayout,
+    TrtllmGemmOperandLayout,
+)
 from .routergemm import get_tinygemm2_module
 
 
@@ -129,6 +134,8 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+
+_NVFP4_BLOCK_SIZE = 16
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -1211,6 +1218,13 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             lambda shapes: shapes[5][0],  # key so a mid-tune resize never
         ),  # changes the key (would otherwise cause a silent cache miss).
     ),
+)
+
+
+_MM_FP8_TUNING_CONFIG = replace(
+    _FP8_GEMM_SM100_TUNING_CONFIG,
+    use_cold_l2_cache=True,
+    use_cuda_graph=True,
 )
 
 
@@ -4480,6 +4494,40 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+def _parse_trtllm_gemm_activation(activation: str) -> GemmActivationType:
+    if activation == "none":
+        return GemmActivationType.None_
+    if activation == "relu2":
+        return GemmActivationType.Relu2
+    raise ValueError(
+        f"Unsupported activation {activation!r}; expected 'none' or 'relu2'"
+    )
+
+
+def _check_mm_fp8_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+) -> bool:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"mm_fp8 accepts 2d tensors, got {a.shape} and {b.shape}")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            "K dimension mismatch in mm_fp8. "
+            f"got a.shape[1] = {a.shape[1]}, b.shape[0] = {b.shape[0]}"
+        )
+    if a.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"a must be a float8_e4m3fn tensor, got {a.dtype=}")
+    if b.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"b must be a float8_e4m3fn tensor, got {b.dtype=}")
+    if alpha is not None and alpha.dtype != torch.float:
+        raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
+    if alpha is not None and alpha.numel() != 1:
+        raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
+
+    return True
+
+
 @flashinfer_api(trace=mm_fp8_trace)
 def mm_fp8(
     a: torch.Tensor,
@@ -4487,7 +4535,10 @@ def mm_fp8(
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["trtllm_low_latency"] = "trtllm_low_latency",
+    backend: Literal["trtllm_low_latency", "trtllm"] = "trtllm_low_latency",
+    *,
+    activation: Literal["none", "relu2"] = "none",
+    output_quant_scale: Optional[torch.Tensor] = None,
 ):
     r"""FP8 matrix multiplication.
 
@@ -4501,6 +4552,8 @@ def mm_fp8(
           Weight tensor, shape (k // block_size, n, block_size), fp8 e4m3
           B needs to be pre-processed using `prepare_low_latency_gemm_weights`.
           block_size is 128 for e4m3.
+        - When using "trtllm" backend, a column-major (k, n) transpose view of a
+          row-major fp8 e4m3 weight.
 
     alpha: Optional[torch.Tensor]
         Scale tensor for the output, float. If None, defaults to 1.0 for no scaling.
@@ -4511,9 +4564,18 @@ def mm_fp8(
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If None, a new tensor will be allocated.
 
-    backend: Literal["trtllm_low_latency"]
+    backend: Literal["trtllm_low_latency", "trtllm"]
         Backend to use for computation. Default is "trtllm_low_latency".
         - "trtllm_low_latency": optimized for small M dimension.
+        - "trtllm": GEMMs with optional activation and direct E4M3 output.
+
+    activation: Literal["none", "relu2"]
+        Elementwise activation. The low-latency backend accepts only
+        ``"none"``.
+
+    output_quant_scale: Optional[torch.Tensor]
+        One-element float32 producer quantization multiplier for direct E4M3
+        output. Its caller-owned reciprocal is consumed by the next GEMM.
 
     Returns
     -------
@@ -4538,17 +4600,53 @@ def mm_fp8(
     torch.Size([16, 2560])
     """
 
-    supported_out_dtypes = (torch.bfloat16,)
-    supported_backends = ("trtllm_low_latency",)
-
-    if backend == "trtllm_low_latency":
-        m = a.shape[0]
-        n = b.shape[1]
-    else:
+    supported_backends = ("trtllm_low_latency", "trtllm")
+    if backend not in supported_backends:
         raise ValueError(
             f"Unsupported backend: {backend}. "
             f"Only {supported_backends} are supported for FP8 GEMM operations."
         )
+
+    if backend != "trtllm_low_latency":
+        _check_mm_fp8_problem_size(a, b, alpha)
+
+    activation_type = _parse_trtllm_gemm_activation(activation)
+    trtllm_output_dtype = DtypeTrtllmGen.Bfloat16
+    output_shape = (a.shape[0], b.shape[1])
+
+    if backend == "trtllm":
+        supported_out_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+        if alpha is None:
+            raise ValueError("backend='trtllm' requires alpha")
+        if out_dtype == torch.float8_e4m3fn:
+            if activation_type != GemmActivationType.Relu2:
+                raise ValueError("direct FP8 output is supported only with Relu2")
+            if output_quant_scale is None:
+                raise ValueError("float8_e4m3fn output requires output_quant_scale")
+            if output_quant_scale.dtype != torch.float:
+                raise ValueError(
+                    "output_quant_scale must be a float tensor, "
+                    f"got {output_quant_scale.dtype}"
+                )
+            if output_quant_scale.numel() != 1:
+                raise ValueError(
+                    "output_quant_scale must be a scalar, "
+                    f"got {output_quant_scale.numel()}"
+                )
+            trtllm_output_dtype = DtypeTrtllmGen.E4m3
+        else:
+            if output_quant_scale is not None:
+                raise ValueError(
+                    "output_quant_scale is valid only for float8_e4m3fn output"
+                )
+    else:
+        supported_out_dtypes = (torch.bfloat16,)
+        if activation_type != GemmActivationType.None_:
+            raise ValueError("trtllm_low_latency does not support fused activation")
+        if output_quant_scale is not None:
+            raise ValueError(
+                "trtllm_low_latency does not support direct quantized output"
+            )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -4558,7 +4656,7 @@ def mm_fp8(
                 f"Only {supported_out_dtypes} are supported for FP8 GEMM operations."
             )
         out = torch.empty(
-            (m, n),
+            output_shape,
             device=a.device,
             dtype=out_dtype,
         )
@@ -4568,9 +4666,9 @@ def mm_fp8(
                 f"Unsupported output dtype: {out.dtype}. "
                 f"Only {supported_out_dtypes} are supported for FP8 GEMM operations."
             )
-        if out.shape != (a.shape[0], b.shape[1]):
+        if out.shape != output_shape:
             raise ValueError(
-                f"Output shape mismatch. Expected {a.shape[0], b.shape[1]}, got {out.shape}."
+                f"Output shape mismatch. Expected {output_shape}, got {out.shape}."
             )
         if out.device != a.device:
             raise ValueError(
@@ -4583,11 +4681,27 @@ def mm_fp8(
 
     if backend == "trtllm_low_latency":
         trtllm_low_latency_gemm(a, b, alpha, out)
-    else:
-        raise ValueError(
-            f"Unsupported backend: {backend}. "
-            f"Only {supported_backends} are supported for FP8 GEMM operations."
+        return out
+
+    workspace_buffer = _get_cache_buf(
+        "mm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    tuner = AutoTuner.get()
+    runners = [
+        get_trtllm_gemm_module().trtllm_fp8_gemm_runner(
+            activation_type=activation_type,
+            output_dtype=trtllm_output_dtype,
         )
+    ]
+    inputs = [a, b, alpha, output_quant_scale, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "fp8_gemm",
+        runners,
+        _MM_FP8_TUNING_CONFIG,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
     return out
 
 
@@ -5853,6 +5967,10 @@ def _check_mm_fp4_problem_size(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     # Generic checks
     ## pre-check the input tensor, block scale tensor and alpha tensor
@@ -5883,10 +6001,16 @@ def _check_mm_fp4_problem_size(
     if alpha is not None and alpha.numel() != 1:
         raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
 
-    if out_dtype not in (torch.bfloat16, torch.float16):
+    if activation != "none" and activation != "relu2":
         raise ValueError(
-            f"Unsupported output dtype: {out_dtype}. "
-            f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
+            f"Unsupported activation {activation!r}; expected 'none' or 'relu2'"
+        )
+
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.uint8):
+        raise ValueError(
+            f"Unsupported output dtype: {out_dtype}. Only torch.bfloat16, "
+            "torch.float16, and packed torch.uint8 are supported for FP4 GEMM "
+            "operations."
         )
 
     if use_nvfp4 and block_size != 16:
@@ -5913,6 +6037,10 @@ def _cudnn_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",  # unused
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -5941,13 +6069,13 @@ def _cudnn_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,  # unused
+    alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,  # unused
+    out: Optional[torch.Tensor] = None,
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
@@ -5955,13 +6083,87 @@ def _trtllm_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",
+    output_quant_scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ):
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
-    if out_dtype != torch.bfloat16:
+    if alpha is None:
+        raise ValueError("backend='trtllm' requires alpha")
+    quantized_output = out_dtype == torch.uint8
+    allowed_output_dtypes = (
+        (torch.bfloat16, torch.uint8) if activation == "relu2" else (torch.bfloat16,)
+    )
+    if out_dtype not in allowed_output_dtypes:
         raise ValueError(
             f"Unsupported output dtype: {out_dtype}. "
-            f"Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations."
+            f"Supported TRTLLM FP4 output dtypes are {allowed_output_dtypes}."
+        )
+    if quantized_output:
+        if use_8x4_sf_layout:
+            raise ValueError(
+                "Fused NVFP4 output requires R128c4 input, weight, and output "
+                "scale layouts"
+            )
+        n = b.shape[1]
+        if n % (4 * _NVFP4_BLOCK_SIZE) != 0:
+            raise ValueError(
+                f"Fused NVFP4 output requires N divisible by "
+                f"{4 * _NVFP4_BLOCK_SIZE}, got N={n}"
+            )
+        if output_quant_scale is None:
+            raise ValueError("packed NVFP4 output requires output_quant_scale")
+        if out_scale is None:
+            raise ValueError("packed NVFP4 output requires caller-provided out_scale")
+        if output_quant_scale.dtype != torch.float:
+            raise ValueError(
+                "output_quant_scale must be a float tensor, "
+                f"got {output_quant_scale.dtype}"
+            )
+        if output_quant_scale.numel() != 1:
+            raise ValueError(
+                "output_quant_scale must be a scalar, "
+                f"got {output_quant_scale.numel()}"
+            )
+        output_shape = (a.shape[0], b.shape[1] // 2)
+        if out is not None:
+            if out.dtype != torch.uint8:
+                raise ValueError(f"packed NVFP4 out must have dtype uint8, got {out.dtype}")
+            if out.shape != output_shape:
+                raise ValueError(
+                    f"packed NVFP4 out must have shape {output_shape}, got {out.shape}"
+                )
+            if out.device != a.device:
+                raise ValueError(
+                    f"packed NVFP4 out must be on {a.device}, got {out.device}"
+                )
+            if not out.is_contiguous():
+                raise ValueError("packed NVFP4 out must be contiguous")
+        output_scale_shape = (
+            _pad_up(a.shape[0], 128),
+            _pad_up(b.shape[1] // _NVFP4_BLOCK_SIZE, 4),
+        )
+        if out_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "packed NVFP4 out_scale must have dtype float8_e4m3fn, "
+                f"got {out_scale.dtype}"
+            )
+        if out_scale.shape != output_scale_shape:
+            raise ValueError(
+                f"packed NVFP4 out_scale must have shape {output_scale_shape}, "
+                f"got {out_scale.shape}"
+            )
+        if out_scale.device != a.device:
+            raise ValueError(
+                f"packed NVFP4 out_scale must be on {a.device}, got {out_scale.device}"
+            )
+        if not out_scale.is_contiguous():
+            raise ValueError("packed NVFP4 out_scale must be contiguous")
+    elif output_quant_scale is not None or out_scale is not None:
+        raise ValueError(
+            "output_quant_scale and out_scale are valid only for packed NVFP4 output"
         )
     return True
 
@@ -5982,6 +6184,10 @@ def _cutlass_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",  # unused
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -6008,6 +6214,10 @@ def _cute_dsl_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",  # unused
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
@@ -6040,6 +6250,10 @@ def _b12x_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",  # unused
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
     if get_cuda_version().major < 13:
@@ -6602,6 +6816,10 @@ def _heuristic_func_mm_fp4(
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    *,
+    activation: Literal["none", "relu2"] = "none",  # unused
+    output_quant_scale: Optional[torch.Tensor] = None,  # unused
+    out_scale: Optional[torch.Tensor] = None,  # unused
 ):
     r"""
     Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
@@ -6726,6 +6944,19 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 )
 
 
+_MM_FP4_TUNING_CONFIG_128x4_QUANTIZED_OUTPUT = replace(
+    _MM_FP4_TUNING_CONFIG_128x4,
+    constraint_specs=(
+        *_MM_FP4_TUNING_CONFIG_128x4.constraint_specs,
+        ConstraintSpec(
+            11,  # out_scale_tensor_index
+            0,
+            lambda shapes: _pad_up(shapes[0][0], 128),
+        ),
+    ),
+)
+
+
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -6787,6 +7018,10 @@ def mm_fp4(
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
+    *,
+    activation: Literal["none", "relu2"] = "none",
+    output_quant_scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -6808,10 +7043,11 @@ def mm_fp4(
         Global scale tensor, float scalar.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
+        Output dtype, bf16 or fp16. When ``backend="trtllm"``, fp16 is not supported,
+        and when ``activation="relu2"`` as well, packed uint8 nvfp4 is also supported.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
+        Out tensor, shape (m, n) for bf16 or fp16 dtype, (m, n/2) for packed nvfp4.
 
     block_size: int
         Block size for FP4 quantization, only 16 and 32 are supported. 16 in case of nvfp4 quantization. 32 in case of mxfp4 quantization.
@@ -6837,17 +7073,27 @@ def mm_fp4(
         with the start of the next for reduced launch latency. This parameter is
         only used by the ``cute_dsl`` backend and is ignored by other backends.
 
+    activation: Literal["none", "relu2"]
+        Elementwise activation. Relu2 is available only for explicit "trtllm" backend.
+
+    output_quant_scale: Optional[torch.Tensor]
+        One-element float32 producer multiplier for direct nvfp4 output.
+
+    out_scale: Optional[torch.Tensor]
+        Caller-owned fp8 e4m3 block-scale destination for direct nvfp4 output.
+
     Notes
     -----
     When cudnn/cutlass backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
-    When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
+    When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False` for bf16 output. Direct nvfp4 output requires 128x4 layouts for a, b, and out_scale.
     When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
     nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.
 
     Returns
     -------
     out: torch.Tensor
-        Out tensor, shape (m, n), bf16 or fp16.
+        Out tensor, shape (m, n) for bf16 or fp16 dtypes,
+        (m, n/2) for packed uint8 nvfp4.
 
     Examples
     --------
@@ -6864,10 +7110,34 @@ def mm_fp4(
     torch.Size([48, 256])
     """
 
+    activation_type = _parse_trtllm_gemm_activation(activation)
+    quantized_output = out_dtype == torch.uint8
+    if backend != "trtllm":
+        if quantized_output:
+            raise ValueError(
+                "packed NVFP4 output requires explicit backend='trtllm'"
+            )
+        if activation_type != GemmActivationType.None_:
+            raise ValueError("fused Relu2 requires explicit backend='trtllm'")
+        if output_quant_scale is not None or out_scale is not None:
+            raise ValueError(
+                "output_quant_scale and out_scale are supported only by the fused "
+                "TRTLLM Relu2 path"
+            )
+
+    output_shape = (
+        (a.shape[0], b.shape[1] // 2)
+        if quantized_output
+        else (a.shape[0], b.shape[1])
+    )
+    trtllm_output_dtype = (
+        DtypeTrtllmGen.E2m1 if quantized_output else DtypeTrtllmGen.Bfloat16
+    )
+
     # allocate the output tensor if not provided
     if out is None:
         out = torch.empty(
-            (a.shape[0], b.shape[1]),
+            output_shape,
             device=a.device,
             dtype=out_dtype,
         )
@@ -6890,11 +7160,15 @@ def mm_fp4(
     tuning_config = (
         _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
     )
+    if quantized_output:
+        tuning_config = _MM_FP4_TUNING_CONFIG_128x4_QUANTIZED_OUTPUT
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(tuning_config),
         "trtllm": lambda: get_trtllm_gemm_module().trtllm_fp4_gemm_runner(
-            use_8x4_sf_layout
+            use_8x4_sf_layout,
+            activation_type=activation_type,
+            output_dtype=trtllm_output_dtype,
         ),
         "cutlass": lambda: get_cutlass_fp4_gemm_module(
             major, minor
@@ -6920,6 +7194,9 @@ def mm_fp4(
         use_nvfp4,
         workspace_buffer,
     ]
+    if quantized_output:
+        inputs.extend((output_quant_scale, out_scale))
+
     runner, tactic = tuner.choose_one(
         "fp4_gemm",
         runners,
@@ -7378,14 +7655,19 @@ def gemm_fp8_nt_groupwise(
         get_trtllm_gemm_module().trtllm_gemm(
             DtypeTrtllmGen.E4m3,
             DtypeTrtllmGen.Bfloat16,
+            GemmActivationType.None_,
             workspace_buffer,
             a,
             b,
             a_scale,
             b_scale,
             None,
+            None,
+            None,
             out,
+            None,
             False,
+            TrtllmGemmOperandLayout.UnshuffledTransposed,
             -1,
         )
     elif backend == "cutile":
@@ -7424,14 +7706,24 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
             input_dtype: DtypeTrtllmGen,
             output_dtype: DtypeTrtllmGen,
             use_8x4_sf_layout: bool = True,
+            activation_type: GemmActivationType = GemmActivationType.None_,
+            operand_layout: TrtllmGemmOperandLayout = (
+                TrtllmGemmOperandLayout.ShuffledTransposed
+            ),
         ):
             self._gemm_runner = op.trtllm_gemm
-            self._use_8x4_sf_layout = use_8x4_sf_layout
             self._input_dtype = input_dtype
             self._output_dtype = output_dtype
+            self._use_8x4_sf_layout = use_8x4_sf_layout
+            self._activation_type = activation_type
+            self._operand_layout = operand_layout
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-            return (self._use_8x4_sf_layout,)
+            return (
+                int(self._output_dtype),
+                int(self._activation_type),
+                self._use_8x4_sf_layout,
+            )
 
         def unpack_inputs(
             self,
@@ -7439,25 +7731,16 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
         ) -> Tuple[
             torch.Tensor,
             torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
             torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
+            Optional[torch.Tensor],
             torch.Tensor,
         ]:
-            (
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                _,
-                out,
-                _,
-                _,
-                workspace_buffer,
-            ) = inputs
-            return a, b, a_descale, b_descale, alpha, out, workspace_buffer
+            raise NotImplementedError
 
         def get_valid_tactics(
             self,
@@ -7478,15 +7761,6 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
                 k = a[1] * 2
             else:
                 k = a[1]
-            (
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out,
-                workspace_buffer,
-            ) = self.unpack_inputs(inputs)
             return list(
                 op.trtllm_gemm_tactics(
                     m,
@@ -7494,7 +7768,9 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
                     k,
                     self._input_dtype,
                     self._output_dtype,
+                    self._activation_type,
                     self._use_8x4_sf_layout,
+                    self._operand_layout,
                 )
             )
 
@@ -7505,36 +7781,142 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
             do_preparation: bool = False,
             **kwargs,
         ):
-            a, b, a_descale, b_descale, alpha, out, workspace_buffer = (
-                self.unpack_inputs(inputs)
-            )
+            (
+                a,
+                b,
+                a_scale,
+                b_scale,
+                pre_activation_scale,
+                accumulator_scale,
+                output_quant_scale,
+                out,
+                out_scale,
+                workspace_buffer,
+            ) = self.unpack_inputs(inputs)
             self._gemm_runner(
                 self._input_dtype,
                 self._output_dtype,
+                self._activation_type,
                 workspace_buffer,
                 a,
                 b.T,
-                a_descale,
-                b_descale.T,
-                alpha,
+                a_scale,
+                b_scale,
+                pre_activation_scale,
+                accumulator_scale,
+                output_quant_scale,
                 out,
+                out_scale,
                 self._use_8x4_sf_layout,
+                self._operand_layout,
                 tactic,
             )
             return out
 
-    def trtllm_gemm_runner(
-        input_dtype: DtypeTrtllmGen,
-        output_dtype: DtypeTrtllmGen,
-        use_8x4_sf_layout: bool = True,
+    def trtllm_fp8_gemm_runner(
+        activation_type: GemmActivationType = GemmActivationType.None_,
+        output_dtype: DtypeTrtllmGen = DtypeTrtllmGen.Bfloat16,
     ):
-        return TrtllmGemmRunner(input_dtype, output_dtype, use_8x4_sf_layout)
+        class TrtllmFp8GemmRunner(TrtllmGemmRunner):
+            def unpack_inputs(
+                self,
+                inputs: List[torch.Tensor],
+            ) -> Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                torch.Tensor,
+                Optional[torch.Tensor],
+                torch.Tensor,
+            ]:
+                a, b, alpha, output_quant_scale, out, workspace_buffer = inputs
+                return (
+                    a,
+                    b,
+                    None,
+                    None,
+                    alpha if activation_type == GemmActivationType.Relu2 else None,
+                    alpha if activation_type == GemmActivationType.None_ else None,
+                    output_quant_scale,
+                    out,
+                    None,
+                    workspace_buffer,
+                )
+
+        return TrtllmFp8GemmRunner(
+            DtypeTrtllmGen.E4m3,
+            output_dtype,
+            False,
+            activation_type=activation_type,
+            operand_layout=TrtllmGemmOperandLayout.Standard,
+        )
 
     def trtllm_fp4_gemm_runner(
         use_8x4_sf_layout: bool = True,
+        activation_type: GemmActivationType = GemmActivationType.None_,
+        output_dtype: DtypeTrtllmGen = DtypeTrtllmGen.Bfloat16,
     ):
-        return TrtllmGemmRunner(
-            DtypeTrtllmGen.E2m1, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+        class TrtllmFp4GemmRunner(TrtllmGemmRunner):
+            def unpack_inputs(
+                self,
+                inputs: List[torch.Tensor],
+            ) -> Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                torch.Tensor,
+                Optional[torch.Tensor],
+                torch.Tensor,
+            ]:
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    _,
+                    out,
+                    _,
+                    _,
+                    workspace_buffer,
+                ) = inputs[:10]
+                if output_dtype == DtypeTrtllmGen.E2m1:
+                    output_quant_scale, out_scale = inputs[10:]
+                else:
+                    output_quant_scale = None
+                    out_scale = None
+                pre_activation_scale = (
+                    alpha if activation_type == GemmActivationType.Relu2 else None
+                )
+                accumulator_scale = (
+                    alpha if activation_type == GemmActivationType.None_ else None
+                )
+                return (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale.T,
+                    pre_activation_scale,
+                    accumulator_scale,
+                    output_quant_scale,
+                    out,
+                    out_scale,
+                    workspace_buffer,
+                )
+
+        return TrtllmFp4GemmRunner(
+            DtypeTrtllmGen.E2m1,
+            output_dtype,
+            use_8x4_sf_layout,
+            activation_type=activation_type,
         )
 
     def trtllm_mxfp8_gemm_runner(
@@ -7548,10 +7930,13 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
             ) -> Tuple[
                 torch.Tensor,
                 torch.Tensor,
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
                 torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
+                Optional[torch.Tensor],
                 torch.Tensor,
             ]:
                 (
@@ -7564,15 +7949,28 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
                     workspace_buffer,
                 ) = inputs
                 assert out_dtype == torch.bfloat16
-                return a, b, a_descale, b_descale, None, out, workspace_buffer
+                return (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale.T,
+                    None,
+                    None,
+                    None,
+                    out,
+                    None,
+                    workspace_buffer,
+                )
 
         return TrtllmMxFp8GemmRunner(
-            DtypeTrtllmGen.MxE4m3, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+            DtypeTrtllmGen.MxE4m3,
+            DtypeTrtllmGen.Bfloat16,
+            use_8x4_sf_layout,
         )
 
     # Register the module
     return SimpleNamespace(
-        trtllm_gemm_runner=trtllm_gemm_runner,
+        trtllm_fp8_gemm_runner=trtllm_fp8_gemm_runner,
         trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
         trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
         trtllm_gemm=op.trtllm_gemm,

@@ -67,12 +67,18 @@ bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
 
 }  // namespace
 
+enum class TrtllmGemmOperandLayout : int64_t {
+  Standard = 0,
+  ShuffledTransposed = 1,
+  UnshuffledTransposed = 2,
+};
+
 struct TrtllmGenGemmRunnerOptions {
   gemm::trtllm::gen::Dtype eltType;
   gemm::trtllm::gen::Dtype outputType;
-  bool transposeMmaOutput{false};
+  gemm::gemm::EltwiseActType activationType;
   gemm::trtllm::gen::SfLayout sfLayoutB;
-  gemm::gemm::MatrixLayout layoutA{gemm::gemm::MatrixLayout::MajorK};
+  TrtllmGemmOperandLayout operandLayout;
 };
 
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
@@ -146,13 +152,37 @@ class TrtllmGenGemmRunner {
     mPassingConfigIndices.clear();
     int const sv = getSMVersion();
 
+    bool const transposeMmaOutput =
+        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    bool const useShuffledMatrix =
+        mOptions.operandLayout == TrtllmGemmOperandLayout::ShuffledTransposed;
+    bool const useDeepSeekFp8 =
+        mOptions.operandLayout == TrtllmGemmOperandLayout::UnshuffledTransposed;
+
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
       auto const options = configs[i].mOptions;
 
-      if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType &&
-          options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
-          options.mSfLayoutB == mOptions.sfLayoutB &&
-          options.mLayoutA == mOptions.layoutA) {  // FIXME(siyuanf): expose matrix layout to user
+      if (options.mDtypeA == mOptions.eltType && options.mDtypeB == mOptions.eltType &&
+          options.mDtypeC == mOptions.outputType &&
+          options.mEltwiseActType == mOptions.activationType &&
+          options.mTransposeMmaOutput == transposeMmaOutput &&
+          options.mUseShuffledMatrix == useShuffledMatrix &&
+          options.mUseDeepSeekFp8 == useDeepSeekFp8 && options.mSfLayoutB == mOptions.sfLayoutB &&
+          options.mLayoutA == gemm::gemm::MatrixLayout::MajorK) {  // FIXME(siyuanf): expose matrix layout to user
+        if (mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1 ||
+            mOptions.eltType == gemm::trtllm::gen::Dtype::MxE4m3) {
+          int32_t const blockSize =
+              mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1 ? 16 : 32;
+          if (options.mSfLayoutA != gemm::trtllm::gen::SfLayout::R128c4 ||
+              options.mSfBlockSizeA != blockSize || options.mSfBlockSizeB != blockSize) {
+            continue;
+          }
+        }
+        if (mOptions.outputType == gemm::trtllm::gen::Dtype::E2m1 &&
+            (options.mSfLayoutC != gemm::trtllm::gen::SfLayout::R128c4 ||
+             options.mSfBlockSizeC != 16 || options.mDtypeSfC != gemm::trtllm::gen::Dtype::E4m3)) {
+          continue;
+        }
         if (!isArchCompatible(sv, configs[i].mSm)) continue;
         mPassingConfigIndices.push_back(i);
       }
@@ -181,8 +211,10 @@ class TrtllmGenGemmRunner {
                      "No valid tactic found for the given options",
                      "mDtypeA: ", gemm::trtllm::gen::dtypeToString(mOptions.eltType),
                      "mDtypeC: ", gemm::trtllm::gen::dtypeToString(mOptions.outputType),
-                     "mTransposeMmaOutput: ", mOptions.transposeMmaOutput,
-                     "mSfLayoutB: ", gemm::trtllm::gen::sfLayoutToString(mOptions.sfLayoutB));
+                     "mTransposeMmaOutput: ", transposeMmaOutput,
+                     "mSfLayoutB: ", gemm::trtllm::gen::sfLayoutToString(mOptions.sfLayoutB),
+                     "mEltwiseActType: ", static_cast<int64_t>(mOptions.activationType),
+                     "operandLayout: ", static_cast<int64_t>(mOptions.operandLayout));
   }
 
   void checkPassingConfigIndex(int64_t tactic) const {
@@ -202,8 +234,10 @@ class TrtllmGenGemmRunner {
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
+    bool const transposeMmaOutput =
+        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
     gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
     gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
@@ -215,8 +249,8 @@ class TrtllmGenGemmRunner {
   }
 
   void run(int64_t m, int64_t n, int64_t k, void const* a, void const* aScale, void const* b,
-           void const* bScale, void* c, void* cScale, void* cScalePtr, void* workspace,
-           CUstream stream, int32_t device_index, int64_t tactic) {
+           void const* bScale, void* c, void* cScale, void* cScalePtr, void* scaleAct,
+           void* workspace, CUstream stream, int32_t device_index, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
@@ -225,9 +259,11 @@ class TrtllmGenGemmRunner {
     TVM_FFI_ICHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB) << "Invalid sf layout in run";
 
     gemm::gemm::GemmData gemmData;
+    bool const transposeMmaOutput =
+        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     // Dims
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
     gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
     gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
@@ -240,11 +276,12 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
     // Inputs
-    gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
-    gemmData.mInputBuffers.mPtrSfA = mOptions.transposeMmaOutput ? bScale : aScale;
-    gemmData.mInputBuffers.mPtrB = mOptions.transposeMmaOutput ? a : b;
-    gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? aScale : bScale;
+    gemmData.mInputBuffers.mPtrA = transposeMmaOutput ? b : a;
+    gemmData.mInputBuffers.mPtrSfA = transposeMmaOutput ? bScale : aScale;
+    gemmData.mInputBuffers.mPtrB = transposeMmaOutput ? a : b;
+    gemmData.mInputBuffers.mPtrSfB = transposeMmaOutput ? aScale : bScale;
     gemmData.mInputBuffers.mPtrScaleC = cScale;
+    gemmData.mInputBuffers.mPtrScaleAct = scaleAct;
 
     // Outputs
     gemmData.mOutputBuffers.mPtrC = c;
@@ -280,9 +317,11 @@ class TrtllmGenGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     gemm::gemm::GemmData gemmData;
+    bool const transposeMmaOutput =
+        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     // Dims
-    gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
-    gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
     gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
     gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
@@ -340,7 +379,7 @@ class TrtllmGenGemmRunner {
   }
 
   int64_t selectHeuristic(int64_t m, int64_t n, int64_t k) const {
-    if (mOptions.eltType == gemm::trtllm::gen::Dtype::E4m3) {
+    if (mOptions.operandLayout == TrtllmGemmOperandLayout::UnshuffledTransposed) {
       return select_kernel_fp8(m, n, k, gemm::gemm::GemmInterface());
     } else {
       auto sortedIndices = getValidTactics(m, n, k);
@@ -359,12 +398,17 @@ class TrtllmGenGemmRunner {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, TensorView workspace_buffer,
-                 TensorView a, TensorView b, TensorView a_scale, TensorView b_scale,
-                 Optional<TensorView> globalScale, TensorView out, bool use_8x4_sf_layout,
-                 int64_t tactic) {
+void trtllm_gemm(
+    int64_t input_dtype_, int64_t output_dtype_, int64_t activation_type_,
+    TensorView workspace_buffer, TensorView a, TensorView b, Optional<TensorView> a_scale,
+    Optional<TensorView> b_scale,
+    Optional<TensorView> pre_activation_scale, Optional<TensorView> accumulator_scale,
+    Optional<TensorView> output_quant_scale, TensorView out, Optional<TensorView> out_scale,
+    bool use_8x4_sf_layout, int64_t operand_layout_, int64_t tactic) {
   auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
   auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
+  auto activation_type = static_cast<gemm::gemm::EltwiseActType>(activation_type_);
+  auto operand_layout = static_cast<TrtllmGemmOperandLayout>(operand_layout_);
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
@@ -378,41 +422,73 @@ void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, TensorView workspa
   TVM_FFI_ICHECK(a.dtype() == dl_float8_e4m3fn || a.dtype() == dl_uint8)
       << "a must be a Float8 or Byte(e2m1) tensor";
   bool is_fp8 = a.dtype() == dl_float8_e4m3fn;
-  if (is_fp8) {
-    TVM_FFI_ICHECK(!globalScale.has_value()) << "globalScale must be a none tensor";
-  } else {
-    CHECK_INPUT(a_scale);
-    CHECK_INPUT(b_scale);
-    if (globalScale.has_value()) {
-      CHECK_INPUT(globalScale.value());
-    }
+  if (!is_fp8) {
+    TVM_FFI_ICHECK(a_scale.has_value() && b_scale.has_value())
+        << "E2M1 input requires a_scale and b_scale";
+    CHECK_INPUT(a_scale.value());
+    CHECK_INPUT(b_scale.value());
+  }
+  if (pre_activation_scale.has_value()) {
+    CHECK_INPUT(pre_activation_scale.value());
+  }
+  if (accumulator_scale.has_value()) {
+    CHECK_INPUT(accumulator_scale.value());
+  }
+  if (output_quant_scale.has_value()) {
+    CHECK_INPUT(output_quant_scale.value());
+  }
+  if (out_scale.has_value()) {
+    CHECK_DEVICE(a, out_scale.value());
+    CHECK_INPUT(out_scale.value());
   }
 
   int32_t m = a.size(0);
   int32_t k = is_fp8 ? a.size(1) : a.size(1) * 2;
   int32_t n = b.size(0);
   TVM_FFI_ICHECK_EQ(b.size(1), a.size(1)) << "Matrix dimensions don't match for multiplication";
-  TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
+  if (output_dtype == gemm::trtllm::gen::Dtype::E2m1) {
+    TVM_FFI_ICHECK_EQ(out.dtype(), dl_uint8);
+    TVM_FFI_ICHECK(out.size(0) == m && out.size(1) * 2 == n)
+        << "Output tensor has wrong dimensions";
+    TVM_FFI_ICHECK(output_quant_scale.has_value() && out_scale.has_value())
+        << "E2M1 output requires output_quant_scale and out_scale";
+  } else {
+    TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n)
+        << "Output tensor has wrong dimensions";
+    if (output_dtype == gemm::trtllm::gen::Dtype::E4m3) {
+      TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
+      TVM_FFI_ICHECK(output_quant_scale.has_value() && !out_scale.has_value())
+          << "E4M3 output requires output_quant_scale and has no scale sidecar";
+    }
+  }
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = input_dtype,
       .outputType = output_dtype,
-      .transposeMmaOutput = true,
+      .activationType = activation_type,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
-      .layoutA = gemm::gemm::MatrixLayout::MajorK,  // currently only support major k layout
+      .operandLayout = operand_layout,
   });
 
   if (tactic == -1) {
     tactic = runner.selectHeuristic(m, n, k);
   }
 
+  void* scaleAct =
+      pre_activation_scale.has_value() ? pre_activation_scale.value().data_ptr() : nullptr;
+  void* scaleC = accumulator_scale.has_value()
+                     ? accumulator_scale.value().data_ptr()
+                     : (output_quant_scale.has_value() ? output_quant_scale.value().data_ptr()
+                                                       : nullptr);
   auto stream = get_stream(a.device());
 
   auto runKernel = [&](void* workspace) {
-    runner.run(m, n, k, a.data_ptr(), a_scale.data_ptr(), b.data_ptr(), b_scale.data_ptr(),
-               out.data_ptr(), globalScale.has_value() ? globalScale.value().data_ptr() : nullptr,
-               nullptr, workspace, stream, a.device().device_id, tactic);
+    runner.run(m, n, k, a.data_ptr(),
+               a_scale.has_value() ? a_scale.value().data_ptr() : nullptr, b.data_ptr(),
+               b_scale.has_value() ? b_scale.value().data_ptr() : nullptr, out.data_ptr(), scaleC,
+               out_scale.has_value() ? out_scale.value().data_ptr() : nullptr, scaleAct, workspace,
+               stream, a.device().device_id, tactic);
   };
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
@@ -426,23 +502,37 @@ void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, TensorView workspa
   }
 }
 
-Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype_,
-                                   int64_t output_dtype_, bool use_8x4_sf_layout) {
+Array<int64_t> trtllm_gemm_tactics(
+    int64_t m, int64_t n, int64_t k, int64_t input_dtype_, int64_t output_dtype_,
+    int64_t activation_type_, bool use_8x4_sf_layout, int64_t operand_layout_) {
   auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
   auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
+  auto activation_type = static_cast<gemm::gemm::EltwiseActType>(activation_type_);
+  auto operand_layout = static_cast<TrtllmGemmOperandLayout>(operand_layout_);
+
   TVM_FFI_CHECK(input_dtype == gemm::trtllm::gen::Dtype::E4m3 ||
                     input_dtype == gemm::trtllm::gen::Dtype::MxE4m3 ||
                     input_dtype == gemm::trtllm::gen::Dtype::E2m1,
                 "Unsupported input dtype");
-  TVM_FFI_CHECK(output_dtype == gemm::trtllm::gen::Dtype::Bfloat16, "Unsupported output dtype");
+  TVM_FFI_CHECK(output_dtype == gemm::trtllm::gen::Dtype::Bfloat16 ||
+                    output_dtype == gemm::trtllm::gen::Dtype::E4m3 ||
+                    output_dtype == gemm::trtllm::gen::Dtype::E2m1,
+                "Unsupported output dtype");
+  TVM_FFI_CHECK(activation_type == gemm::gemm::EltwiseActType::None ||
+                    activation_type == gemm::gemm::EltwiseActType::Relu2,
+                "Unsupported activation type");
+  TVM_FFI_CHECK(operand_layout == TrtllmGemmOperandLayout::Standard ||
+                    operand_layout == TrtllmGemmOperandLayout::ShuffledTransposed ||
+                    operand_layout == TrtllmGemmOperandLayout::UnshuffledTransposed,
+                "Unsupported operand layout");
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = input_dtype,
       .outputType = output_dtype,
-      .transposeMmaOutput = true,
+      .activationType = activation_type,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
-      .layoutA = gemm::gemm::MatrixLayout::MajorK,  // currently only support major k layout
+      .operandLayout = operand_layout,
   });
 
   return runner.getValidTactics(m, n, k);
