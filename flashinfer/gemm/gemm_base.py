@@ -4615,7 +4615,10 @@ def mm_fp8(
     output_shape = (a.shape[0], b.shape[1])
 
     if backend == "trtllm":
-        supported_out_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+        supported_out_dtypes: Tuple[torch.dtype, ...] = (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        )
         if alpha is None:
             raise ValueError("backend='trtllm' requires alpha")
         if out_dtype == torch.float8_e4m3fn:
@@ -6124,13 +6127,14 @@ def _trtllm_gemm_fp4_requirement(
             )
         if output_quant_scale.numel() != 1:
             raise ValueError(
-                "output_quant_scale must be a scalar, "
-                f"got {output_quant_scale.numel()}"
+                f"output_quant_scale must be a scalar, got {output_quant_scale.numel()}"
             )
         output_shape = (a.shape[0], b.shape[1] // 2)
         if out is not None:
             if out.dtype != torch.uint8:
-                raise ValueError(f"packed NVFP4 out must have dtype uint8, got {out.dtype}")
+                raise ValueError(
+                    f"packed NVFP4 out must have dtype uint8, got {out.dtype}"
+                )
             if out.shape != output_shape:
                 raise ValueError(
                     f"packed NVFP4 out must have shape {output_shape}, got {out.shape}"
@@ -7114,9 +7118,7 @@ def mm_fp4(
     quantized_output = out_dtype == torch.uint8
     if backend != "trtllm":
         if quantized_output:
-            raise ValueError(
-                "packed NVFP4 output requires explicit backend='trtllm'"
-            )
+            raise ValueError("packed NVFP4 output requires explicit backend='trtllm'")
         if activation_type != GemmActivationType.None_:
             raise ValueError("fused Relu2 requires explicit backend='trtllm'")
         if output_quant_scale is not None or out_scale is not None:
@@ -7126,9 +7128,7 @@ def mm_fp4(
             )
 
     output_shape = (
-        (a.shape[0], b.shape[1] // 2)
-        if quantized_output
-        else (a.shape[0], b.shape[1])
+        (a.shape[0], b.shape[1] // 2) if quantized_output else (a.shape[0], b.shape[1])
     )
     trtllm_output_dtype = (
         DtypeTrtllmGen.E2m1 if quantized_output else DtypeTrtllmGen.Bfloat16

@@ -152,8 +152,7 @@ class TrtllmGenGemmRunner {
     mPassingConfigIndices.clear();
     int const sv = getSMVersion();
 
-    bool const transposeMmaOutput =
-        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    bool const transposeMmaOutput = mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     bool const useShuffledMatrix =
         mOptions.operandLayout == TrtllmGemmOperandLayout::ShuffledTransposed;
     bool const useDeepSeekFp8 =
@@ -168,11 +167,11 @@ class TrtllmGenGemmRunner {
           options.mTransposeMmaOutput == transposeMmaOutput &&
           options.mUseShuffledMatrix == useShuffledMatrix &&
           options.mUseDeepSeekFp8 == useDeepSeekFp8 && options.mSfLayoutB == mOptions.sfLayoutB &&
-          options.mLayoutA == gemm::gemm::MatrixLayout::MajorK) {  // FIXME(siyuanf): expose matrix layout to user
+          options.mLayoutA ==
+              gemm::gemm::MatrixLayout::MajorK) {  // FIXME(siyuanf): expose matrix layout to user
         if (mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1 ||
             mOptions.eltType == gemm::trtllm::gen::Dtype::MxE4m3) {
-          int32_t const blockSize =
-              mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1 ? 16 : 32;
+          int32_t const blockSize = mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1 ? 16 : 32;
           if (options.mSfLayoutA != gemm::trtllm::gen::SfLayout::R128c4 ||
               options.mSfBlockSizeA != blockSize || options.mSfBlockSizeB != blockSize) {
             continue;
@@ -234,8 +233,7 @@ class TrtllmGenGemmRunner {
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;
-    bool const transposeMmaOutput =
-        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    bool const transposeMmaOutput = mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
@@ -259,8 +257,7 @@ class TrtllmGenGemmRunner {
     TVM_FFI_ICHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB) << "Invalid sf layout in run";
 
     gemm::gemm::GemmData gemmData;
-    bool const transposeMmaOutput =
-        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    bool const transposeMmaOutput = mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     // Dims
     gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
@@ -317,8 +314,7 @@ class TrtllmGenGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     gemm::gemm::GemmData gemmData;
-    bool const transposeMmaOutput =
-        mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
+    bool const transposeMmaOutput = mOptions.operandLayout != TrtllmGemmOperandLayout::Standard;
     // Dims
     gemmData.mProblemDimensions.mM = transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = transposeMmaOutput ? m : n;
@@ -398,13 +394,13 @@ class TrtllmGenGemmRunner {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void trtllm_gemm(
-    int64_t input_dtype_, int64_t output_dtype_, int64_t activation_type_,
-    TensorView workspace_buffer, TensorView a, TensorView b, Optional<TensorView> a_scale,
-    Optional<TensorView> b_scale,
-    Optional<TensorView> pre_activation_scale, Optional<TensorView> accumulator_scale,
-    Optional<TensorView> output_quant_scale, TensorView out, Optional<TensorView> out_scale,
-    bool use_8x4_sf_layout, int64_t operand_layout_, int64_t tactic) {
+void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, int64_t activation_type_,
+                 TensorView workspace_buffer, TensorView a, TensorView b,
+                 Optional<TensorView> a_scale, Optional<TensorView> b_scale,
+                 Optional<TensorView> pre_activation_scale, Optional<TensorView> accumulator_scale,
+                 Optional<TensorView> output_quant_scale, TensorView out,
+                 Optional<TensorView> out_scale, bool use_8x4_sf_layout, int64_t operand_layout_,
+                 int64_t tactic) {
   auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
   auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
   auto activation_type = static_cast<gemm::gemm::EltwiseActType>(activation_type_);
@@ -453,8 +449,7 @@ void trtllm_gemm(
     TVM_FFI_ICHECK(output_quant_scale.has_value() && out_scale.has_value())
         << "E2M1 output requires output_quant_scale and out_scale";
   } else {
-    TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n)
-        << "Output tensor has wrong dimensions";
+    TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
     if (output_dtype == gemm::trtllm::gen::Dtype::E4m3) {
       TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
       TVM_FFI_ICHECK(output_quant_scale.has_value() && !out_scale.has_value())
@@ -477,16 +472,16 @@ void trtllm_gemm(
 
   void* scaleAct =
       pre_activation_scale.has_value() ? pre_activation_scale.value().data_ptr() : nullptr;
-  void* scaleC = accumulator_scale.has_value()
-                     ? accumulator_scale.value().data_ptr()
-                     : (output_quant_scale.has_value() ? output_quant_scale.value().data_ptr()
-                                                       : nullptr);
+  void* scaleC =
+      accumulator_scale.has_value()
+          ? accumulator_scale.value().data_ptr()
+          : (output_quant_scale.has_value() ? output_quant_scale.value().data_ptr() : nullptr);
   auto stream = get_stream(a.device());
 
   auto runKernel = [&](void* workspace) {
-    runner.run(m, n, k, a.data_ptr(),
-               a_scale.has_value() ? a_scale.value().data_ptr() : nullptr, b.data_ptr(),
-               b_scale.has_value() ? b_scale.value().data_ptr() : nullptr, out.data_ptr(), scaleC,
+    runner.run(m, n, k, a.data_ptr(), a_scale.has_value() ? a_scale.value().data_ptr() : nullptr,
+               b.data_ptr(), b_scale.has_value() ? b_scale.value().data_ptr() : nullptr,
+               out.data_ptr(), scaleC,
                out_scale.has_value() ? out_scale.value().data_ptr() : nullptr, scaleAct, workspace,
                stream, a.device().device_id, tactic);
   };
@@ -502,9 +497,9 @@ void trtllm_gemm(
   }
 }
 
-Array<int64_t> trtllm_gemm_tactics(
-    int64_t m, int64_t n, int64_t k, int64_t input_dtype_, int64_t output_dtype_,
-    int64_t activation_type_, bool use_8x4_sf_layout, int64_t operand_layout_) {
+Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype_,
+                                   int64_t output_dtype_, int64_t activation_type_,
+                                   bool use_8x4_sf_layout, int64_t operand_layout_) {
   auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
   auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
   auto activation_type = static_cast<gemm::gemm::EltwiseActType>(activation_type_);
