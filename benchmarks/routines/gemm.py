@@ -187,7 +187,18 @@ def parse_gemm_args(line, parser):
         default=False,
         help="Use bias (enabled for mm_bf16 with TGV and TinyGEMM backends)",
     )
-
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default="none",
+        choices=["none", "relu2"],
+        help=(
+            "Optional Relu2 epilogue for explicit TRTLLM mm_fp4/mm_fp8. "
+            "Use --out_dtype fp8_e4m3 or nvfp4 for direct quantized output; "
+            "mm_fp4 also requires --use_nvfp4, and direct nvfp4 output requires "
+            "--use_128x4_sf_layout."
+        ),
+    )
     args = parser.parse_args(line)
     has_backends_arg = any(
         token == "--backends" or token.startswith("--backends=") for token in line
@@ -212,7 +223,12 @@ def parse_gemm_args(line, parser):
             args.input_dtype = "bfloat16"
     if args.routine == "mm_fp8":
         if not has_backends_arg:
-            args.backends = ["trtllm_low_latency"]
+            args.backends = (
+                ["trtllm"] if args.activation == "relu2" else ["trtllm_low_latency"]
+            )
+    if args.routine == "mm_fp4" and args.activation == "relu2":
+        if not has_backends_arg:
+            args.backends = ["trtllm"]
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -848,8 +864,8 @@ def testMmFp8(args):
 
     This test:
     1. Generates random input tensors and quantizes them to FP8
-    2. Pre-shuffles the weight tensor into the low-latency block layout
-    3. Runs mm_fp8
+    2. Prepares the weight layout required by the selected TRTLLM path
+    3. Runs mm_fp8 with the requested activation and output representation
     4. Runs reference check against the unquantized bf16 GEMM
     5. Measures performance metrics (TFLOPS, TB/sec)
 
@@ -877,8 +893,10 @@ def testMmFp8(args):
     k = args.k
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = ["trtllm_low_latency"]
+    autotune_supported_backends = ["trtllm_low_latency", "trtllm"]
     res = []
+
+    activation = args.activation
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype != torch.float8_e4m3fn:
@@ -893,17 +911,25 @@ def testMmFp8(args):
         )
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if res_dtype != torch.bfloat16:
+    if res_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
-            f"Unsupported res dtype: {res_dtype}. mm_fp8 only supports bfloat16."
+            f"Unsupported res dtype: {res_dtype}. mm_fp8 supports bfloat16 and fp8_e4m3."
         )
+    quantized_output = res_dtype == torch.float8_e4m3fn
+    if quantized_output and activation != "relu2":
+        raise ValueError("Direct FP8 output requires --activation relu2")
 
     if args.batch_size != 1:
         raise ValueError("mm_fp8 is a 2D GEMM; only --batch_size 1 is supported.")
-    if k % 128 != 0:
-        raise ValueError(f"mm_fp8 requires k % 128 == 0, got k = {k}")
-    if n % 32 != 0:
-        raise ValueError(f"mm_fp8 requires n % 32 == 0, got n = {n}")
+    if "trtllm_low_latency" in backends:
+        if k % 128 != 0:
+            raise ValueError(
+                f"mm_fp8 trtllm_low_latency requires k % 128 == 0, got k = {k}"
+            )
+        if n % 32 != 0:
+            raise ValueError(
+                f"mm_fp8 trtllm_low_latency requires n % 32 == 0, got n = {n}"
+            )
     ## Done parsing input arguments
 
     ## Prepare input tensors
@@ -913,17 +939,45 @@ def testMmFp8(args):
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
     mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=mat2_dtype)
 
-    # Pre-shuffle the weights into the (k // 128, n, 128) low-latency block
-    # layout. The dict memoizes the (expensive) permutation indices; a fresh one
-    # is fine since weight prep runs once here, outside the timed region.
-    mat2_prepared = flashinfer.prepare_low_latency_gemm_weights(mat2_fp8, {})
     alpha = (input_inv_s * mat2_inv_s).float()  # a_scale * b_scale
+
+    reference_output = None
+    if run_refcheck or quantized_output:
+        reference_output = torch.mm(input_tensor, mat2.T)
+        if activation == "relu2":
+            reference_output = torch.relu(reference_output).square()
+
+    output_quant_scale = None
+    out = None
+    if activation == "relu2":
+        if quantized_output:
+            output_quant_scale = (
+                448.0 / reference_output.float().abs().amax().clamp_min(1e-6)
+            ).reshape(1)
+        out = torch.empty((m, n), dtype=res_dtype, device=device)
+
+    mat2_low_latency = None
+    if "trtllm_low_latency" in backends:
+        # The low-latency backend consumes a pre-shuffled
+        # (k // 128, n, 128) weight layout.
+        mat2_low_latency = flashinfer.prepare_low_latency_gemm_weights(mat2_fp8, {})
+
+    def prepared_mat2(backend):
+        if backend == "trtllm_low_latency":
+            return mat2_low_latency
+        # The ordinary TRTLLM backend consumes a column-major transpose view.
+        return mat2_fp8.T
+
+    if not run_refcheck:
+        reference_output = None
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_fp8.shape = }")
         print(f"[VVERBOSE] {input_fp8.dtype = }")
-        print(f"[VVERBOSE] {mat2_prepared.shape = }")
-        print(f"[VVERBOSE] {mat2_prepared.dtype = }")
+        for backend in backends:
+            mat2_prepared = prepared_mat2(backend)
+            print(f"[VVERBOSE] {backend = }, {mat2_prepared.shape = }")
+            print(f"[VVERBOSE] {backend = }, {mat2_prepared.dtype = }")
         print(f"[VVERBOSE] {input_inv_s = }")
         print(f"[VVERBOSE] {mat2_inv_s = }")
 
@@ -936,12 +990,16 @@ def testMmFp8(args):
     backends_to_remove = []
     for backend in backends:
         try:
+            mat2_prepared = prepared_mat2(backend)
             flashinfer.mm_fp8(
                 input_fp8,
                 mat2_prepared,
                 alpha,
                 out_dtype=res_dtype,
+                out=out,
                 backend=backend,
+                activation=activation,
+                output_quant_scale=output_quant_scale,
             )
         except Exception as e:
             print(
@@ -956,19 +1014,24 @@ def testMmFp8(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return res
 
-    def run_backend(backend, input_fp8, mat2_prepared, alpha):
+    def run_backend(
+        backend,
+        input_fp8,
+        mat2_prepared,
+        alpha,
+        output_quant_scale,
+        out,
+    ):
         return flashinfer.mm_fp8(
             input_fp8,
             mat2_prepared,
             alpha,
             out_dtype=res_dtype,
+            out=out,
             backend=backend,
+            activation=activation,
+            output_quant_scale=output_quant_scale,
         )
-
-    has_reference_output = False
-    if run_refcheck:
-        reference_output = torch.mm(input_tensor, mat2.T)
-        has_reference_output = True
 
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -981,7 +1044,14 @@ def testMmFp8(args):
                     print(f"[INFO] Autotune warmup for mm_fp8: {warmup_iters} iters")
                 with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
-                        run_backend(cur_backend, input_fp8, mat2_prepared, alpha)
+                        run_backend(
+                            cur_backend,
+                            input_fp8,
+                            prepared_mat2(cur_backend),
+                            alpha,
+                            output_quant_scale,
+                            out,
+                        )
     elif cache_path:
         with autotune(False, cache=cache_path):
             pass
@@ -990,9 +1060,15 @@ def testMmFp8(args):
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
+        cur_mat2 = prepared_mat2(cur_backend)
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, input_fp8, mat2_prepared, alpha
+                cur_backend,
+                input_fp8,
+                cur_mat2,
+                alpha,
+                output_quant_scale,
+                out,
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -1002,17 +1078,27 @@ def testMmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, mat2_prepared, alpha),
+            input_args=(
+                cur_backend,
+                input_fp8,
+                cur_mat2,
+                alpha,
+                output_quant_scale,
+                out,
+            ),
         )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
-        if run_refcheck and has_reference_output:
+        if run_refcheck and reference_output is not None:
             for i in range(len(tested_backends)):
+                tested_output = tested_outputs[i]
+                if quantized_output:
+                    tested_output = tested_output.float() / output_quant_scale
                 cos_sim = F.cosine_similarity(
                     reference_output.reshape(-1),
-                    tested_outputs[i].reshape(-1),
+                    tested_output.reshape(-1),
                     dim=0,
                 )
                 if torch.isnan(cos_sim) or cos_sim < 0.99:
@@ -1061,6 +1147,7 @@ def testMmFp8(args):
                 cur_res["mat2_dtype"] = mat2_dtype
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend_name
+                cur_res["activation"] = activation
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -1325,11 +1412,21 @@ def testMmFp4(args):
     ]
     res = []
 
+    activation = args.activation
+
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if res_dtype not in [torch.bfloat16, torch.float16]:
+    if res_dtype not in [torch.bfloat16, torch.float16, torch.uint8]:
         raise ValueError(
-            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16, float16, and nvfp4."
         )
+    quantized_output = res_dtype == torch.uint8
+    if quantized_output and activation != "relu2":
+        raise ValueError("Direct NVFP4 output requires --activation relu2")
+    if activation == "relu2":
+        if not use_nvfp4:
+            raise ValueError("mm_fp4 Relu2 requires --use_nvfp4")
+        if res_dtype not in (torch.bfloat16, torch.uint8):
+            raise ValueError("mm_fp4 Relu2 supports bfloat16 and nvfp4 output")
 
     input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
@@ -1388,6 +1485,33 @@ def testMmFp4(args):
         if not use_nvfp4
         else None
     )
+
+    reference_output = None
+    if run_refcheck or quantized_output:
+        reference_output = torch.mm(input, mat2.T)
+        if activation == "relu2":
+            reference_output = torch.relu(reference_output).square()
+
+    output_quant_scale = None
+    out = None
+    out_scale = None
+    if activation == "relu2":
+        if quantized_output:
+            output_quant_scale = (
+                (448 * 6) / reference_output.float().abs().amax().clamp_min(1e-6)
+            ).reshape(1)
+            out = torch.empty((m, n // 2), dtype=res_dtype, device=device)
+            out_scale = torch.empty(
+                ((m + 127) // 128 * 128, (n // 16 + 3) // 4 * 4),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+        else:
+            out = torch.empty((m, n), dtype=res_dtype, device=device)
+
+    if not run_refcheck:
+        reference_output = None
+
     # Completed preparing inputs. Now programmatically filter backends
     block_size = 16 if use_nvfp4 else 32
     backends_to_remove = []
@@ -1410,6 +1534,7 @@ def testMmFp4(args):
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
                 alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
+                out=out,
                 block_size=16
                 if use_nvfp4
                 else 32,  # nvfp4 only supports 16; mxfp4 only supports 32.
@@ -1417,6 +1542,9 @@ def testMmFp4(args):
                 backend=backend,
                 use_nvfp4=use_nvfp4,
                 enable_pdl=args.enable_pdl,
+                activation=activation,
+                output_quant_scale=output_quant_scale,
+                out_scale=out_scale,
             )
         except Exception as e:
             print(
@@ -1440,6 +1568,9 @@ def testMmFp4(args):
         input_inv_s,
         mat2_inv_s,
         mat2_inv_s_trtllm,
+        output_quant_scale,
+        out,
+        out_scale,
     ):
         return flashinfer.gemm.mm_fp4(
             a=input_fp4,
@@ -1448,17 +1579,16 @@ def testMmFp4(args):
             b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
             alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
             out_dtype=res_dtype,
+            out=out,
             block_size=block_size,
             use_8x4_sf_layout=not use_128x4_sf_layout,
             backend=backend,
             use_nvfp4=use_nvfp4,
             enable_pdl=args.enable_pdl,
+            activation=activation,
+            output_quant_scale=output_quant_scale,
+            out_scale=out_scale,
         )
-
-    has_reference_output = False
-    if run_refcheck:
-        reference_output = torch.mm(input, mat2.T)
-        has_reference_output = True
 
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -1478,6 +1608,9 @@ def testMmFp4(args):
                         input_inv_s,
                         mat2_inv_s,
                         mat2_inv_s_trtllm,
+                        output_quant_scale,
+                        out,
+                        out_scale,
                     )
     elif cache_path:
         with autotune(False, cache=cache_path):
@@ -1496,6 +1629,9 @@ def testMmFp4(args):
                 input_inv_s,
                 mat2_inv_s,
                 mat2_inv_s_trtllm,
+                output_quant_scale,
+                out,
+                out_scale,
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -1513,17 +1649,30 @@ def testMmFp4(args):
                 input_inv_s,
                 mat2_inv_s,
                 mat2_inv_s_trtllm,
+                output_quant_scale,
+                out,
+                out_scale,
             ),
         )
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
-        if run_refcheck and has_reference_output:
+        if run_refcheck and reference_output is not None:
             for i in range(len(tested_backends)):
+                tested_output = tested_outputs[i]
+                if quantized_output:
+                    tested_output = flashinfer.e2m1_and_ufp8sf_scale_to_float(
+                        tested_output,
+                        out_scale.view(torch.uint8),
+                        output_quant_scale.reciprocal(),
+                        sf_vec_size=16,
+                        ufp8_type=1,
+                        is_sf_swizzled_layout=True,
+                    ).to(device)
                 cos_sim = F.cosine_similarity(
                     reference_output.reshape(-1),
-                    tested_outputs[i].reshape(-1),
+                    tested_output.reshape(-1),
                     dim=0,
                 )
                 if cos_sim < 0.97:
@@ -1548,9 +1697,10 @@ def testMmFp4(args):
             median_time = np.median(backend_times[backend])
             std_time = np.std(backend_times[backend])
             problem_flops = 2 * m * n * k
-            problem_bytes = (
-                m * k * 0.5 + n * k * 0.5 + m * n * res_dtype.itemsize
-            )  # 0.5 for fp4
+            output_bytes = m * n * (0.5 if quantized_output else res_dtype.itemsize)
+            if quantized_output:
+                output_bytes += out_scale.numel() * out_scale.element_size()
+            problem_bytes = m * k * 0.5 + n * k * 0.5 + output_bytes
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
@@ -1569,6 +1719,7 @@ def testMmFp4(args):
                 cur_res["use_128x4_sf_layout"] = use_128x4_sf_layout
                 cur_res["backend"] = backend_name
                 cur_res["use_nvfp4"] = use_nvfp4
+                cur_res["activation"] = activation
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

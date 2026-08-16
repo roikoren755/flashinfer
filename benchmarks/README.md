@@ -32,8 +32,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
     - `mm_mxfp8` - Dense MXFP8 matrix multiplication.
-    - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
-    - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
+    - `mm_fp8` - Matrix multiplication with FP8 inputs. The ordinary routine uses the trtllm-gen low-latency GEMM; `--backends trtllm --activation relu2` benchmarks the fused Relu2 path.
+    - `mm_fp4` - Matrix multiplication with FP4 inputs. `--use_nvfp4 --backends trtllm --activation relu2` benchmarks NVFP4 GEMM with fused Relu2.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
 - MOE:
@@ -229,22 +229,23 @@ The output CSV will contain detailed metrics including:
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
 
 ### GEMM Flags
-| Flag                     | Description                                                                                                 |
-|--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--m`                    | Number of rows of matrix A and output matrix (GEMM M dimension)                                            |
-| `--n`                    | Number of columns of matrix B and output matrix (GEMM N dimension)                                         |
-| `--k`                    | Number of columns of matrix A / rows of matrix B (GEMM K dimension)                                        |
-| `--tile_size`            | Tile size for the GEMM operation (affects performance and scaling)                                         |
-| `--group_size`           | Number of groups for group GEMM (batching multiple GEMMs together)                                         |
-| `--scale_major_mode`     | Layout for FP8 scaling: `MN` (per output tile) or `K` (per input tile)                                     |
-| `--out_dtype`            | Output data type: `bfloat16` or `float16`                                                                  |
-| `--mma_sm`               | Number of SMs to use for the MMA operation (1 or 2)                                                        |
-| `--input_dtype`          | Data type for input matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                 |
-| `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
-| `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
-| `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
+| Flag                     | Description                                                                                                                      |
+|--------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `--m`                    | Number of rows of matrix A and output matrix (GEMM M dimension)                                                                  |
+| `--n`                    | Number of columns of matrix B and output matrix (GEMM N dimension)                                                               |
+| `--k`                    | Number of columns of matrix A / rows of matrix B (GEMM K dimension)                                                              |
+| `--tile_size`            | Tile size for the GEMM operation (affects performance and scaling)                                                               |
+| `--group_size`           | Number of groups for group GEMM (batching multiple GEMMs together)                                                               |
+| `--scale_major_mode`     | Layout for FP8 scaling: `MN` (per output tile) or `K` (per input tile)                                                           |
+| `--out_dtype`            | Output data type. Supported values depend on the routine.                                                                        |
+| `--mma_sm`               | Number of SMs to use for the MMA operation (1 or 2)                                                                              |
+| `--input_dtype`          | Data type for input matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                                       |
+| `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                                      |
+| `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                                                |
+| `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)                                |
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines) |
-| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
+| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                                                 |
+| `--activation`           | Optional activation for `mm_fp4`/`mm_fp8`: `none` (default) or `relu2`. Relu2 uses explicit TRTLLM only.                         |
 
 ### MOE Flags
 | Flag                     | Description                                                                                                 |

@@ -38,6 +38,7 @@ output_column_dict = {
         "mma_sm",
         "use_128x4_sf_layout",
         "use_nvfp4",
+        "activation",
         "bias",
     ],
     "moe": [
